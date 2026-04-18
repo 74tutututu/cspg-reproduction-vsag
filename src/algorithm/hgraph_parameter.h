@@ -67,6 +67,11 @@ public:
 
     DataTypes data_type{DataTypes::DATA_TYPE_FLOAT};
 
+    //CSPG动态参数
+    int cspg_m;        
+    float cspg_lambda; 
+    // ===========================
+
     std::string name;
 };
 

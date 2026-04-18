@@ -29,7 +29,7 @@ public:
 
     JsonType
     ToJson() const override;
-
+  
     bool
     CheckCompatibility(const vsag::ParamPtr& other) const override;
 

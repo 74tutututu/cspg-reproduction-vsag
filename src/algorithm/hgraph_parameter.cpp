@@ -124,6 +124,14 @@ HGraphParameter::FromJson(const JsonType& json) {
     if (json.Contains(SUPPORT_TOMBSTONE)) {
         this->support_tombstone = json[SUPPORT_TOMBSTONE].GetBool();
     }
+
+    // 解析 CSPG 参数
+    if (json.Contains("cspg_m")) {
+        this->cspg_m = json["cspg_m"].GetInt();
+    }
+    if (json.Contains("cspg_lambda")) {
+        this->cspg_lambda = json["cspg_lambda"].GetFloat();
+    }
 }
 
 JsonType
@@ -139,6 +147,9 @@ HGraphParameter::ToJson() const {
     json[ALPHA_KEY].SetFloat(this->alpha);
     json[SUPPORT_DUPLICATE].SetBool(this->support_duplicate);
     json[TRAIN_SAMPLE_COUNT_KEY].SetInt(this->train_sample_count);
+    //print new parameters
+    json["cspg_m"].SetInt(this->cspg_m);
+    json["cspg_lambda"].SetFloat(this->cspg_lambda);
     return json;
 }
 

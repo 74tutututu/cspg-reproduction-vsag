@@ -90,6 +90,12 @@ HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonPa
     }
     check_and_init_raw_vector(hgraph_param->raw_vector_param, common_param);
     resize(bottom_graph_->max_capacity_);
+
+    //从参数对象读取并赋值给成员变量
+    this->cspg_m_ = hgraph_param->cspg_m;
+    this->cspg_lambda_ = hgraph_param->cspg_lambda;
+
+    printf("DEBUG: CSPG_M = %d, CSPG_LAMBDA = %f\n", this->cspg_m_, this->cspg_lambda_);
 }
 void
 HGraph::Train(const DatasetPtr& base) {
@@ -128,6 +134,10 @@ HGraph::Build(const DatasetPtr& data) {
 JsonType
 HGraph::map_hgraph_param(const JsonType& hgraph_json) {
     static const ConstParamMap external_mapping = {
+        {"cspg_m", {"cspg_m"}},
+
+        {"cspg_lambda", {"cspg_lambda"}},
+
         {
             HGRAPH_USE_REORDER,
             {
@@ -1525,6 +1535,23 @@ HGraph::add_one_point(const void* data, int level, InnerIdType inner_id) {
             raw_vector_->InsertVector(data, inner_id);
         }
     }
+
+    // CSPG:定分区归属
+    {
+        // 使用 thread_local 保证每个线程有自己独立的随机生成器，线程安全
+        thread_local std::mt19937 local_gen(std::random_device{}());
+        std::uniform_real_distribution<float> dist(0.0, 1.0);
+        
+        float rand_val = dist(local_gen);
+        // node_partition_ 已经在 resize 提前扩容，这里是单点按索引写入，天然安全
+        if (rand_val < cspg_lambda_) {
+            node_partition_[inner_id] = -1; // -1 代表它是超脱于分区的“全局路由点”
+        } else {
+            node_partition_[inner_id] = inner_id % cspg_m_; // 简单均匀分配到 0~m-1
+        }
+    }
+    // ===================================
+
     std::unique_lock add_lock(add_mutex_);
     if (level >= static_cast<int>(this->route_graphs_.size()) || bottom_graph_->TotalCount() == 0) {
         std::scoped_lock<std::shared_mutex> wlock(this->global_mutex_);
@@ -1590,7 +1617,23 @@ HGraph::graph_add_one(const void* data, int level, InnerIdType inner_id) {
             auto [dist, id] = result->Top();
             result->Pop();
             if (id != inner_id) {
-                filtered_result->Push(dist, id);
+               // 修改：连边
+                bool can_connect = false;
+                
+                // 判断逻辑：如果新来的点或者候选邻居中，只要有一个的分区号是 -1 (路由节点)，就允许连线
+                if (node_partition_[inner_id] == -1 || node_partition_[id] == -1) {
+                    can_connect = true;
+                } 
+                // 否则，两者必须在同一个分区才能连线
+                else if (node_partition_[inner_id] == node_partition_[id]) {
+                    can_connect = true;
+                }
+
+                // 通过规则允许加入后续的 mutually_connect_new_element
+                if (can_connect) {
+                    filtered_result->Push(dist, id);
+                }
+                // ========================================
             }
         }
         LockGuard cur_lock(neighbors_mutex_, inner_id);
@@ -1654,6 +1697,11 @@ HGraph::resize(uint64_t new_size) {
         pool_ = std::make_shared<VisitedListPool>(1, allocator_, new_size_power_2, allocator_);
         this->label_table_->Resize(new_size_power_2);
         bottom_graph_->Resize(new_size_power_2);
+
+        // ==== 【CSPG 修改：同步扩容我们的分区数组】 ====
+        this->node_partition_.resize(new_size_power_2, -1);
+        // ============================================
+
         this->basic_flatten_codes_->Resize(new_size_power_2);
         if (use_reorder_) {
             this->high_precise_codes_->Resize(new_size_power_2);
@@ -1666,6 +1714,8 @@ HGraph::resize(uint64_t new_size) {
         }
         this->max_capacity_.store(new_size_power_2);
         this->cal_memory_usage();
+
+        
     }
 }
 void
@@ -2195,6 +2245,7 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
         search_param.hops_limit = params.hops_limit;
     }
 
+    //Algorithm 1 (Line 7-14)
     auto search_result = this->search_one_graph(
         raw_query, this->bottom_graph_, this->basic_flatten_codes_, search_param, vt, &ctx);
 

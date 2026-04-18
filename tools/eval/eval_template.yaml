@@ -5,7 +5,8 @@ global:
         to: "stdout"
       save-to-file:
         format: "json"
-        to: "file://tmp/eval_example_output.json"
+        # 结果保存在当前目录
+        to: "file://./eval_example_output.json" 
       send-to-influxdb:
         format: "line_protocol"
         to: "influxdb://127.0.0.1:8086/api/v2/write?org=7d71a0eb85deafbe&bucket=583a2fd8dd85e66c&precision=ns"
@@ -13,12 +14,14 @@ global:
           token: "Token mlIiP-zVfcooHhMbGG9Yk-KfrkHyDc2h-rphnIBda8UMe_6Qocy8tNmV323yxOPEAsC8uIs6_nb-XUSMEAO76A=="
 
 eval_case1:
-    datapath: "/tmp/sift-128-euclidean.hdf5"
-    type: "search" # `build` or `search` or `build,search`
+    # 直接读取当前目录下的 HDF5 文件
+    datapath: "/workspaces/vsag/build-release/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "build,search" # `build` or `search` or `build,search`
     index_name: "hgraph"
-    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300}}'
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":4,"cspg_lambda":0.05}}'
     search_params: '{"hgraph":{"ef_search":60}}'
-    index_path: "/tmp/sift-128-euclidean/index/hgraph_index"
+    # 索引保存在当前目录的 index 文件夹下
+    index_path: "./index/hgraph_index"
     search_mode: "knn" # ["knn", "range", "knn_filter", "range_filter"]
     topk: 10
     range: 0.5

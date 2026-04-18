@@ -355,6 +355,12 @@ private:
     cal_memory_usage();
 
 private:
+    // CSPG变量添加区
+    int cspg_m_ = 4;                 // 论文中的 m：将图划分为 4 个分区
+    float cspg_lambda_ = 0.05;       // 论文中的 λ：5% 的节点被选为全局路由节点
+    std::vector<int> node_partition_; // 记录每个点属于哪个分区 (0~m-1)，-1 代表路由节点
+    // =================================
+
     FlattenInterfacePtr basic_flatten_codes_{nullptr};
     FlattenInterfacePtr high_precise_codes_{nullptr};
 
