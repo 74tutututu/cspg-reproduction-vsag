@@ -15,7 +15,7 @@ global:
 
 eval_case1:
     # 直接读取当前目录下的 HDF5 文件
-    datapath: "/workspaces/vsag/build-release/tools/eval/data/sift-128-euclidean.hdf5"
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
     type: "build,search" # `build` or `search` or `build,search`
     index_name: "hgraph"
     create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":4,"cspg_lambda":0.05}}'
