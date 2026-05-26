@@ -233,7 +233,7 @@ TEST_CASE("HGraph Search Parameters Parse CSPG", "[ut][HGraphParameter][Search]"
         auto params = vsag::HGraphSearchParameters::FromJson(
             R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_phase1_partition_count":2}})");
         REQUIRE(params.cspg_phase1_partition_count == 2);
-        REQUIRE(params.cspg_phase1_use_route_descent);
+        REQUIRE_FALSE(params.cspg_phase1_use_route_descent);
     }
 
     SECTION("parse cspg phase1 route descent") {

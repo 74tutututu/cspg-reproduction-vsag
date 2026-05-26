@@ -89,9 +89,9 @@ public:
     int64_t cspg_ef1{1};  // CSPG 第一阶段候选池大小
     int64_t cspg_ef2{0};  // CSPG 第二阶段候选池大小，0 表示复用 ef_search
     int64_t cspg_phase1_partition_count{1};
-    // HGraph 默认保留 route descent 以稳定 phase-1 seed 质量；
-    // 需要更贴近论文 Algorithm 1 时可显式设为 false。
-    bool cspg_phase1_use_route_descent{true};
+    // 默认贴近论文 Algorithm 1，不先走 route graph。
+    // 需要 HGraph 风格增强路径时可显式设为 true.
+    bool cspg_phase1_use_route_descent{false};
     int64_t cspg_cross_partition_hops_limit{0};
     int64_t cspg_cross_partition_switch_limit{0};
     int64_t cspg_recursive_fanout_bound_slack_percent{0};
