@@ -35,6 +35,8 @@ For examples, refer to [103_index_hgraph.cpp](https://github.com/antgroup/vsag/b
 | **Quantization** | precise_quantization_type | string | "fp32" | Conditional | High-precision type for reordering |
 | **Graph** | max_degree | int | 64 | No | Max edges per node |
 | **Graph** | ef_construction | int | 400 | No | Candidate list size during construction |
+| **CSPG** | cspg_m | int | 2 | No | Number of CSPG partitions |
+| **CSPG** | cspg_lambda | float | 0.5 | No | Routing vector ratio |
 | **Graph** | graph_type | string | "nsw" | No | Graph algorithm: nsw, odescent |
 | **Memory** | hgraph_init_capacity | int | 100 | No | Initial index capacity |
 | **Performance** | build_thread_count | int | 100 | No | Construction thread count |
@@ -99,6 +101,18 @@ For examples, refer to [103_index_hgraph.cpp](https://github.com/antgroup/vsag/b
 - **Parameter Description**: Size of the dynamic candidate list during graph construction, affects construction quality
 - **Optional Values**: 1 to INT_MAX
 - **Default Value**: 400
+
+### cspg_m
+- **Parameter Type**: int
+- **Parameter Description**: Number of CSPG partitions
+- **Optional Values**: 1 to INT_MAX
+- **Default Value**: 2
+
+### cspg_lambda
+- **Parameter Type**: float
+- **Parameter Description**: Routing vector ratio for CSPG
+- **Optional Values**: 0.0 to 1.0
+- **Default Value**: 0.5
 
 ### hgraph_init_capacity
 - **Parameter Type**: int
@@ -217,6 +231,12 @@ means that the index uses PQ quantization with 64 subspaces, enables reordering 
 - **Optional Values**: 1 to INT_MAX
 - **Default Value**: Must be provided (no default value)
 
+### cspg_ef1
+- **Parameter Type**: int
+- **Parameter Description**: Candidate list size for CSPG stage-1 search
+- **Optional Values**: 1 to INT_MAX
+- **Default Value**: 1
+
 ## Examples for Search Parameter String
 ```json
 "hgraph": {
@@ -224,3 +244,11 @@ means that the index uses PQ quantization with 64 subspaces, enables reordering 
 }
 ```
 means that the search will use an ef_search value of 200 to control the search quality and performance trade-off.
+
+```json
+"hgraph": {
+    "ef_search": 200,
+    "cspg_ef1": 1
+}
+```
+means that the search will use CSPG stage-1 candidate size 1 and stage-2 ef_search 200.

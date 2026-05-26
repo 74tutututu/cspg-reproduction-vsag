@@ -46,6 +46,9 @@ public:
     bool
     CheckCompatibility(const ParamPtr& other) const override;
 
+    [[nodiscard]] uint32_t
+    ResolveCspgPartitionMaxDegree() const;
+
 public:
     FlattenInterfaceParamPtr base_codes_param{nullptr};
     GraphInterfaceParamPtr bottom_graph_param{nullptr};
@@ -67,9 +70,10 @@ public:
 
     DataTypes data_type{DataTypes::DATA_TYPE_FLOAT};
 
-    //CSPG动态参数
-    int cspg_m;        
-    float cspg_lambda; 
+    // CSPG 默认关闭，显式设置 cspg_m > 1 时开启。
+    int cspg_m{1};
+    float cspg_lambda{0.5F};
+    int cspg_partition_max_degree{0};
     // ===========================
 
     std::string name;
@@ -82,6 +86,17 @@ public:
 
 public:
     int64_t ef_search{30};
+    int64_t cspg_ef1{1};  // CSPG 第一阶段候选池大小
+    int64_t cspg_ef2{0};  // CSPG 第二阶段候选池大小，0 表示复用 ef_search
+    int64_t cspg_phase1_partition_count{1};
+    // HGraph 默认保留 route descent 以稳定 phase-1 seed 质量；
+    // 需要更贴近论文 Algorithm 1 时可显式设为 false。
+    bool cspg_phase1_use_route_descent{true};
+    int64_t cspg_cross_partition_hops_limit{0};
+    int64_t cspg_cross_partition_switch_limit{0};
+    int64_t cspg_recursive_fanout_bound_slack_percent{0};
+    int64_t cspg_local_routing_budget{0};
+    bool cspg_enable_stats{false};
     uint32_t hops_limit{std::numeric_limits<uint32_t>::max()};
     bool use_reorder{false};
     bool use_extra_info_filter{false};

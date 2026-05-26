@@ -275,6 +275,47 @@ private:
     graph_add_one(const void* data, int level, InnerIdType inner_id);
 
     void
+    ensure_cspg_partition_graphs();
+
+    void
+    ensure_cspg_partition_route_graphs();
+
+    void
+    ensure_cspg_partition_route_levels(int partition_id, size_t level_count);
+
+    GraphInterfacePtr
+    generate_one_partition_graph();
+
+    GraphInterfacePtr
+    generate_one_partition_route_graph();
+
+    [[nodiscard]] GraphInterfacePtr
+    get_cspg_partition_route_graph(int partition_id, int level) const;
+
+    [[nodiscard]] size_t
+    get_cspg_partition_route_level_count(int partition_id) const;
+
+    [[nodiscard]] std::vector<int>
+    get_cspg_target_partitions(int assigned_partition) const;
+
+    void
+    rebuild_cspg_partition_route_entries();
+
+    [[nodiscard]] InnerIdType
+    find_cspg_partition_route_entry(int partition_id, int* level = nullptr) const;
+
+    [[nodiscard]] InnerIdType
+    choose_any_cspg_entry_point() const;
+
+    bool
+    is_cspg_enabled() const {
+        return this->cspg_m_ > 1;
+    }
+
+    [[nodiscard]] GraphInterfacePtr
+    get_cspg_partition_graph(int partition_id) const;
+
+    void
     resize(uint64_t new_size);
 
     GraphInterfacePtr
@@ -355,18 +396,28 @@ private:
     cal_memory_usage();
 
 private:
-    // CSPG变量添加区
-    int cspg_m_ = 4;                 // 论文中的 m：将图划分为 4 个分区
-    float cspg_lambda_ = 0.05;       // 论文中的 λ：5% 的节点被选为全局路由节点
-    std::vector<int> node_partition_; // 记录每个点属于哪个分区 (0~m-1)，-1 代表路由节点
-    // =================================
+    // CSPG 相关参数与状态
+    int cspg_m_ = 1;                          // 默认关闭，显式设置 m > 1 时开启 CSPG
+    float cspg_lambda_ = 0.5F;                // 路由点比例 λ（论文默认 0.5）
+    std::vector<int> node_partition_;         // 每个点所属分区(0~m-1)，-1 表示路由点
+    std::vector<int> staged_node_partition_;  // 批量构图时预采样的分区信息
+    std::vector<InnerIdType> cspg_partition_entry_points_;
+    std::vector<InnerIdType> cspg_partition_route_entry_points_;
+    std::vector<int> cspg_partition_route_entry_levels_;
+    Vector<GraphInterfacePtr> cspg_partition_graphs_;
+    std::vector<std::vector<GraphInterfacePtr>> cspg_partition_route_graphs_;
 
     FlattenInterfacePtr basic_flatten_codes_{nullptr};
     FlattenInterfacePtr high_precise_codes_{nullptr};
 
     Vector<GraphInterfacePtr> route_graphs_;
     GraphInterfacePtr bottom_graph_{nullptr};
+    GraphInterfaceParamPtr bottom_graph_param_{nullptr};
+    GraphInterfaceParamPtr cspg_partition_graph_param_{nullptr};
     SparseGraphDatacellParamPtr hierarchical_datacell_param_{nullptr};
+    SparseGraphDatacellParamPtr cspg_partition_hierarchical_datacell_param_{nullptr};
+
+    IndexCommonParam common_param_;
 
     bool use_elp_optimizer_{false};
     bool ignore_reorder_{false};

@@ -15,6 +15,9 @@
 
 #include "hgraph_parameter.h"
 
+#include <algorithm>
+#include <cmath>
+
 #include "datacell/extra_info_datacell_parameter.h"
 #include "datacell/flatten_datacell_parameter.h"
 #include "datacell/graph_datacell_parameter.h"
@@ -125,12 +128,27 @@ HGraphParameter::FromJson(const JsonType& json) {
         this->support_tombstone = json[SUPPORT_TOMBSTONE].GetBool();
     }
 
-    // 解析 CSPG 参数
+    // 解析 CSPG 参数并做范围校验
     if (json.Contains("cspg_m")) {
         this->cspg_m = json["cspg_m"].GetInt();
     }
     if (json.Contains("cspg_lambda")) {
         this->cspg_lambda = json["cspg_lambda"].GetFloat();
+    }
+    if (json.Contains(HGRAPH_CSPG_PARTITION_MAX_DEGREE)) {
+        this->cspg_partition_max_degree = json[HGRAPH_CSPG_PARTITION_MAX_DEGREE].GetInt();
+    }
+    CHECK_ARGUMENT(this->cspg_m > 0, "cspg_m must be greater than 0");
+    CHECK_ARGUMENT(this->cspg_lambda >= 0.0F && this->cspg_lambda <= 1.0F,
+                   "cspg_lambda must be in range [0.0, 1.0]");
+    CHECK_ARGUMENT(this->cspg_partition_max_degree >= 0,
+                   "cspg_partition_max_degree must be greater than or equal to 0");
+    if (this->cspg_partition_max_degree > 0) {
+        CHECK_ARGUMENT(this->cspg_partition_max_degree >= 4,
+                       "cspg_partition_max_degree must be 0 or at least 4");
+        CHECK_ARGUMENT(static_cast<uint64_t>(this->cspg_partition_max_degree) <=
+                           this->bottom_graph_param->max_degree_,
+                       "cspg_partition_max_degree must not exceed max_degree");
     }
 }
 
@@ -150,6 +168,7 @@ HGraphParameter::ToJson() const {
     //print new parameters
     json["cspg_m"].SetInt(this->cspg_m);
     json["cspg_lambda"].SetFloat(this->cspg_lambda);
+    json[HGRAPH_CSPG_PARTITION_MAX_DEGREE].SetInt(this->cspg_partition_max_degree);
     return json;
 }
 
@@ -191,7 +210,35 @@ HGraphParameter::CheckCompatibility(const ParamPtr& other) const {
         logger::error("HGraphParameter::CheckCompatibility: support_duplicate must be the same");
         return false;
     }
+    if (cspg_m != hgraph_param->cspg_m ||
+        std::abs(cspg_lambda - hgraph_param->cspg_lambda) > 1e-6F ||
+        cspg_partition_max_degree != hgraph_param->cspg_partition_max_degree) {
+        logger::error(
+            "HGraphParameter::CheckCompatibility: CSPG build parameters must be the same");
+        return false;
+    }
     return true;
+}
+
+uint32_t
+HGraphParameter::ResolveCspgPartitionMaxDegree() const {
+    if (this->bottom_graph_param == nullptr) {
+        return 0;
+    }
+    const auto bottom_max_degree = this->bottom_graph_param->max_degree_;
+    if (this->cspg_partition_max_degree > 0 || this->cspg_m <= 1) {
+        return this->cspg_partition_max_degree > 0
+                   ? static_cast<uint32_t>(this->cspg_partition_max_degree)
+                   : static_cast<uint32_t>(bottom_max_degree);
+    }
+
+    const double partition_size_ratio =
+        static_cast<double>(this->cspg_lambda) +
+        (1.0 - static_cast<double>(this->cspg_lambda)) / static_cast<double>(this->cspg_m);
+    const auto scaled_partition_degree = static_cast<uint64_t>(
+        std::llround(static_cast<double>(bottom_max_degree) * partition_size_ratio));
+    return static_cast<uint32_t>(
+        std::clamp<uint64_t>(scaled_partition_degree, 1, bottom_max_degree));
 }
 
 HGraphSearchParameters
@@ -211,6 +258,57 @@ HGraphSearchParameters::FromJson(const std::string& json_string) {
         fmt::format(
             "parameters[{}] must contains {}", INDEX_TYPE_HGRAPH, HGRAPH_PARAMETER_EF_RUNTIME));
     obj.ef_search = params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_EF_RUNTIME].GetInt();
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_EF1)) {
+        obj.cspg_ef1 = params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_EF1].GetInt();
+        CHECK_ARGUMENT(obj.cspg_ef1 > 0, "cspg_ef1 must be greater than 0");
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_EF2)) {
+        obj.cspg_ef2 = params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_EF2].GetInt();
+        CHECK_ARGUMENT(obj.cspg_ef2 > 0, "cspg_ef2 must be greater than 0");
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_PHASE1_PARTITION_COUNT)) {
+        obj.cspg_phase1_partition_count =
+            params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_PHASE1_PARTITION_COUNT].GetInt();
+        CHECK_ARGUMENT(obj.cspg_phase1_partition_count > 0,
+                       "cspg_phase1_partition_count must be greater than 0");
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_PHASE1_USE_ROUTE_DESCENT)) {
+        obj.cspg_phase1_use_route_descent =
+            params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_PHASE1_USE_ROUTE_DESCENT].GetBool();
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_HOPS_LIMIT)) {
+        obj.cspg_cross_partition_hops_limit =
+            params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_HOPS_LIMIT].GetInt();
+        CHECK_ARGUMENT(obj.cspg_cross_partition_hops_limit >= 0,
+                       "cspg_cross_partition_hops_limit must be greater than or equal to 0");
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_SWITCH_LIMIT)) {
+        obj.cspg_cross_partition_switch_limit =
+            params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_SWITCH_LIMIT]
+                .GetInt();
+        CHECK_ARGUMENT(obj.cspg_cross_partition_switch_limit >= 0,
+                       "cspg_cross_partition_switch_limit must be greater than or equal to 0");
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(
+            HGRAPH_PARAMETER_CSPG_RECURSIVE_FANOUT_BOUND_SLACK_PERCENT)) {
+        obj.cspg_recursive_fanout_bound_slack_percent =
+            params[INDEX_TYPE_HGRAPH]
+                  [HGRAPH_PARAMETER_CSPG_RECURSIVE_FANOUT_BOUND_SLACK_PERCENT]
+                      .GetInt();
+        CHECK_ARGUMENT(obj.cspg_recursive_fanout_bound_slack_percent >= 0 &&
+                           obj.cspg_recursive_fanout_bound_slack_percent <= 100,
+                       "cspg_recursive_fanout_bound_slack_percent must be between 0 and 100");
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_LOCAL_ROUTING_BUDGET)) {
+        obj.cspg_local_routing_budget =
+            params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_LOCAL_ROUTING_BUDGET].GetInt();
+        CHECK_ARGUMENT(obj.cspg_local_routing_budget >= 0,
+                       "cspg_local_routing_budget must be greater than or equal to 0");
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_ENABLE_STATS)) {
+        obj.cspg_enable_stats =
+            params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_ENABLE_STATS].GetBool();
+    }
     if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_HOPS_LIMIT)) {
         obj.hops_limit = params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_HOPS_LIMIT].GetInt();
     }

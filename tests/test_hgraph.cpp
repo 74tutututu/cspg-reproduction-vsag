@@ -122,6 +122,140 @@ constexpr static const char* search_param_tmp = R"(
             }}
         }})";
 
+namespace {
+
+constexpr static const char* cspg_search_param_tmp = R"(
+        {{
+            "hgraph": {{
+                "ef_search": {},
+                "cspg_ef1": 1,
+                "cspg_ef2": {}
+            }}
+        }})";
+
+constexpr static const char* baseline_build_param_tmp = R"(
+    {{
+        "dtype": "float32",
+        "metric_type": "{}",
+        "dim": {},
+        "index_param": {{
+            "base_quantization_type": "fp32",
+            "max_degree": 32,
+            "ef_construction": 300,
+            "build_thread_count": 4,
+            "graph_type": "nsw",
+            "graph_storage_type": "flat",
+            "graph_iter_turn": 10,
+            "neighbor_sample_rate": 0.3,
+            "alpha": 1.2,
+            "support_remove": false,
+            "use_attribute_filter": false,
+            "store_raw_vector": false,
+            "support_duplicate": false,
+            "graph_io_type": "block_memory_io",
+            "graph_file_path": "{}",
+            "rabitq_bits_per_dim_base": 1,
+            "rabitq_bits_per_dim_query": 32
+        }}
+    }}
+    )";
+
+constexpr static const char* cspg_build_param_tmp = R"(
+    {{
+        "dtype": "float32",
+        "metric_type": "{}",
+        "dim": {},
+        "index_param": {{
+            "base_quantization_type": "fp32",
+            "max_degree": 32,
+            "ef_construction": 300,
+            "build_thread_count": 4,
+            "graph_type": "nsw",
+            "graph_storage_type": "flat",
+            "graph_iter_turn": 10,
+            "neighbor_sample_rate": 0.3,
+            "alpha": 1.2,
+            "support_remove": false,
+            "use_attribute_filter": false,
+            "store_raw_vector": false,
+            "support_duplicate": false,
+            "graph_io_type": "block_memory_io",
+            "graph_file_path": "{}",
+            "rabitq_bits_per_dim_base": 1,
+            "rabitq_bits_per_dim_query": 32,
+            "cspg_m": 2,
+            "cspg_lambda": 0.5
+        }}
+    }}
+    )";
+
+int64_t
+Intersection(const int64_t* lhs, int64_t lhs_count, const int64_t* rhs, int64_t rhs_count) {
+    std::unordered_set<int64_t> lhs_set(lhs, lhs + lhs_count);
+    int64_t result = 0;
+    for (int64_t i = 0; i < rhs_count; ++i) {
+        if (lhs_set.count(rhs[i]) != 0) {
+            ++result;
+        }
+    }
+    return result;
+}
+
+struct SearchMetrics {
+    float average_recall{0.0F};
+    double average_dist_cmp{0.0};
+    double average_hops{0.0};
+};
+
+SearchMetrics
+CollectSearchMetrics(const fixtures::TestIndex::IndexPtr& index,
+                     const fixtures::TestDatasetPtr& dataset,
+                     const std::string& search_param,
+                     const std::string& label) {
+    const auto& queries = dataset->query_;
+    const auto& ground_truth = dataset->ground_truth_;
+    const int64_t query_count = queries->GetNumElements();
+    const int64_t dim = queries->GetDim();
+    const int64_t topk = dataset->top_k;
+
+    float total_recall = 0.0F;
+    uint64_t total_dist_cmp = 0;
+    uint64_t total_hops = 0;
+    for (int64_t i = 0; i < query_count; ++i) {
+        auto query = vsag::Dataset::Make();
+        query->NumElements(1)
+            ->Dim(dim)
+            ->Float32Vectors(queries->GetFloat32Vectors() + i * dim)
+            ->Owner(false);
+
+        auto result = index->KnnSearch(query, topk, search_param);
+        REQUIRE(result.has_value());
+        INFO(fmt::format("{} query {} returned topk {}", label, i, result.value()->GetDim()));
+        REQUIRE(result.value()->GetDim() == topk);
+
+        const auto* gt = ground_truth->GetIds() + i * topk;
+        const auto* ids = result.value()->GetIds();
+        total_recall += static_cast<float>(Intersection(gt, topk, ids, topk)) /
+                        static_cast<float>(topk);
+
+        auto stats = result.value()->GetStatistics({"dist_cmp", "hops"});
+        REQUIRE(stats.size() == 2);
+        REQUIRE(!stats[0].empty());
+        REQUIRE(!stats[1].empty());
+        total_dist_cmp += static_cast<uint64_t>(std::stoul(stats[0]));
+        total_hops += static_cast<uint64_t>(std::stoul(stats[1]));
+    }
+
+    SearchMetrics metrics;
+    metrics.average_recall = total_recall / static_cast<float>(query_count);
+    metrics.average_dist_cmp =
+        static_cast<double>(total_dist_cmp) / static_cast<double>(query_count);
+    metrics.average_hops = static_cast<double>(total_hops) / static_cast<double>(query_count);
+    return metrics;
+}
+
+}  // namespace
+
 HGraphResourcePtr
 HGraphTestIndex::GetResource(bool sample) {
     auto resource = std::make_shared<HGraphTestResource>();
@@ -747,6 +881,174 @@ TEST_CASE("(PR) HGraph Build Test", "[ft][hgraph][pr]") {
     auto test_index = std::make_shared<fixtures::HGraphTestIndex>();
     auto resource = test_index->GetResource(true);
     TestHGraphBuild(test_index, resource);
+}
+
+TEST_CASE("(PR) HGraph CSPG Search Smoke", "[ft][hgraph][pr][cspg]") {
+    constexpr int64_t dim = 64;
+    constexpr int64_t base_count = 600;
+    constexpr int64_t ef_search = 120;
+    const std::string metric_type = "l2";
+
+    auto dataset =
+        fixtures::HGraphTestIndex::pool.GetDatasetAndCreate(dim, base_count, metric_type);
+    auto baseline_param = fmt::format(fixtures::baseline_build_param_tmp,
+                                      metric_type,
+                                      dim,
+                                      fixtures::HGraphTestIndex::dir.GenerateRandomFile());
+    auto cspg_param = fmt::format(fixtures::cspg_build_param_tmp,
+                                  metric_type,
+                                  dim,
+                                  fixtures::HGraphTestIndex::dir.GenerateRandomFile());
+
+    auto baseline_index =
+        fixtures::TestIndex::TestFactory(fixtures::HGraphTestIndex::name, baseline_param, true);
+    auto cspg_index =
+        fixtures::TestIndex::TestFactory(fixtures::HGraphTestIndex::name, cspg_param, true);
+
+    fixtures::TestIndex::TestBuildIndex(baseline_index, dataset, true);
+    fixtures::TestIndex::TestBuildIndex(cspg_index, dataset, true);
+
+    auto baseline_search_param = fmt::format(fixtures::search_param_tmp, ef_search, false);
+    auto cspg_search_param = fmt::format(fixtures::cspg_search_param_tmp, ef_search, ef_search);
+
+    const auto baseline_metrics = fixtures::CollectSearchMetrics(
+        baseline_index, dataset, baseline_search_param, "baseline");
+    const auto cspg_metrics =
+        fixtures::CollectSearchMetrics(cspg_index, dataset, cspg_search_param, "cspg");
+
+    INFO(fmt::format("baseline: recall={}, dist_cmp={}, hops={}",
+                     baseline_metrics.average_recall,
+                     baseline_metrics.average_dist_cmp,
+                     baseline_metrics.average_hops));
+    INFO(fmt::format("cspg: recall={}, dist_cmp={}, hops={}",
+                     cspg_metrics.average_recall,
+                     cspg_metrics.average_dist_cmp,
+                     cspg_metrics.average_hops));
+    REQUIRE(baseline_metrics.average_recall >= 0.95F);
+    REQUIRE(cspg_metrics.average_recall >= 0.85F);
+    REQUIRE(cspg_metrics.average_recall + 0.12F >= baseline_metrics.average_recall);
+    // CSPG's primary efficiency target in the paper is fewer distance computations.
+    // Hop counts are less directly comparable because routing vectors are expanded as
+    // partition-specific states in stage 2, so we keep a looser guard there to still
+    // catch pathological blow-ups without penalizing normal cross-partition traversal.
+    REQUIRE(cspg_metrics.average_dist_cmp <= baseline_metrics.average_dist_cmp * 1.5);
+    REQUIRE(cspg_metrics.average_hops <= baseline_metrics.average_hops * 2.5);
+}
+
+TEST_CASE("(PR) HGraph CSPG Serialize Smoke", "[ft][hgraph][pr][cspg][serialization]") {
+    constexpr int64_t dim = 64;
+    constexpr int64_t base_count = 600;
+    constexpr int64_t ef_search = 120;
+    const std::string metric_type = "l2";
+
+    auto dataset =
+        fixtures::HGraphTestIndex::pool.GetDatasetAndCreate(dim, base_count, metric_type);
+    auto cspg_param = fmt::format(fixtures::cspg_build_param_tmp,
+                                  metric_type,
+                                  dim,
+                                  fixtures::HGraphTestIndex::dir.GenerateRandomFile());
+    auto cspg_search_param = fmt::format(fixtures::cspg_search_param_tmp, ef_search, ef_search);
+
+    auto index =
+        fixtures::TestIndex::TestFactory(fixtures::HGraphTestIndex::name, cspg_param, true);
+    auto index2 =
+        fixtures::TestIndex::TestFactory(fixtures::HGraphTestIndex::name, cspg_param, true);
+
+    fixtures::TestIndex::TestBuildIndex(index, dataset, true);
+    fixtures::TestIndex::TestSerializeBinarySet(index, index2, dataset, cspg_search_param, true);
+}
+
+TEST_CASE("(PR) HGraph CSPG Stage2 Stats Smoke", "[ft][hgraph][pr][cspg][stats]") {
+    constexpr int64_t dim = 64;
+    constexpr int64_t base_count = 600;
+    constexpr int64_t ef_search = 120;
+    const std::string metric_type = "l2";
+
+    auto dataset =
+        fixtures::HGraphTestIndex::pool.GetDatasetAndCreate(dim, base_count, metric_type);
+    auto cspg_param = fmt::format(fixtures::cspg_build_param_tmp,
+                                  metric_type,
+                                  dim,
+                                  fixtures::HGraphTestIndex::dir.GenerateRandomFile());
+    auto cspg_search_param = fmt::format(
+        R"({{"hgraph":{{"ef_search":{},"cspg_ef1":1,"cspg_ef2":{},"cspg_enable_stats":true}}}})",
+        ef_search,
+        ef_search);
+
+    auto index =
+        fixtures::TestIndex::TestFactory(fixtures::HGraphTestIndex::name, cspg_param, true);
+    fixtures::TestIndex::TestBuildIndex(index, dataset, true);
+
+    auto query = vsag::Dataset::Make();
+    query->NumElements(1)
+        ->Dim(dim)
+        ->Float32Vectors(dataset->query_->GetFloat32Vectors())
+        ->Owner(false);
+
+    auto result = index->KnnSearch(query, dataset->top_k, cspg_search_param);
+    REQUIRE(result.has_value());
+
+    auto stats = result.value()->GetStatistics({"dist_cmp",
+                                                "hops",
+                                                "cspg_phase1_dist_cmp",
+                                                "cspg_phase1_hops",
+                                                "cspg_stage2_dist_cmp",
+                                                "cspg_stage2_hops",
+                                                "cspg_stage2_local_dist_cmp",
+                                                "cspg_stage2_cross_partition_dist_cmp",
+                                                "cspg_stage2_local_routing_dist_cmp",
+                                                "cspg_stage2_local_nonrouting_dist_cmp",
+                                                "cspg_stage2_routing_pops",
+                                                "cspg_stage2_nonrouting_pops",
+                                                "cspg_stage2_routing_useless_pops",
+                                                "cspg_stage2_nonrouting_useless_pops",
+                                                "cspg_stage2_routing_fanout_attempts",
+                                                "cspg_stage2_routing_fanout_enqueues",
+                                                "cspg_stage2_routing_fanout_skipped_unexpandable",
+                                                "cspg_stage2_routing_fanout_skipped_no_unvisited",
+                                                "cspg_stage2_routing_fanout_skipped_duplicate_state",
+                                                "cspg_stage2_routing_fanout_skipped_frontier_reject"});
+    REQUIRE(stats.size() == 20);
+    for (const auto& value : stats) {
+        REQUIRE(!value.empty());
+    }
+
+    auto parse_stat = [&](size_t index) -> uint64_t { return static_cast<uint64_t>(std::stoull(stats[index])); };
+
+    const auto total_dist_cmp = parse_stat(0);
+    const auto total_hops = parse_stat(1);
+    const auto phase1_dist_cmp = parse_stat(2);
+    const auto phase1_hops = parse_stat(3);
+    const auto stage2_dist_cmp = parse_stat(4);
+    const auto stage2_hops = parse_stat(5);
+    const auto stage2_local_dist_cmp = parse_stat(6);
+    const auto stage2_cross_partition_dist_cmp = parse_stat(7);
+    const auto stage2_local_routing_dist_cmp = parse_stat(8);
+    const auto stage2_local_nonrouting_dist_cmp = parse_stat(9);
+    const auto routing_pops = parse_stat(10);
+    const auto nonrouting_pops = parse_stat(11);
+    const auto routing_useless_pops = parse_stat(12);
+    const auto nonrouting_useless_pops = parse_stat(13);
+    const auto routing_fanout_attempts = parse_stat(14);
+    const auto routing_fanout_enqueues = parse_stat(15);
+    const auto routing_fanout_skipped_unexpandable = parse_stat(16);
+    const auto routing_fanout_skipped_no_unvisited = parse_stat(17);
+    const auto routing_fanout_skipped_duplicate_state = parse_stat(18);
+    const auto routing_fanout_skipped_frontier_reject = parse_stat(19);
+
+    REQUIRE(total_dist_cmp == phase1_dist_cmp + stage2_dist_cmp);
+    REQUIRE(total_hops == phase1_hops + stage2_hops);
+    REQUIRE(stage2_dist_cmp == stage2_local_dist_cmp + stage2_cross_partition_dist_cmp);
+    REQUIRE(stage2_local_dist_cmp ==
+            stage2_local_routing_dist_cmp + stage2_local_nonrouting_dist_cmp);
+    REQUIRE(stage2_hops == routing_pops + nonrouting_pops);
+    REQUIRE(routing_useless_pops <= routing_pops);
+    REQUIRE(nonrouting_useless_pops <= nonrouting_pops);
+    REQUIRE(routing_fanout_enqueues + routing_fanout_skipped_unexpandable +
+                routing_fanout_skipped_no_unvisited +
+                routing_fanout_skipped_duplicate_state +
+                routing_fanout_skipped_frontier_reject ==
+            routing_fanout_attempts);
 }
 
 TEST_CASE("(Daily) HGraph Build Test", "[ft][hgraph][daily]") {

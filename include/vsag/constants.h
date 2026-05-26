@@ -167,6 +167,7 @@ extern const char* const HGRAPH_IGNORE_REORDER;
 extern const char* const HGRAPH_BUILD_BY_BASE_QUANTIZATION;
 extern const char* const HGRAPH_BASE_QUANTIZATION_TYPE;
 extern const char* const HGRAPH_GRAPH_MAX_DEGREE;
+extern const char* const HGRAPH_CSPG_PARTITION_MAX_DEGREE;
 extern const char* const HGRAPH_BUILD_EF_CONSTRUCTION;
 extern const char* const HGRAPH_BUILD_ALPHA;
 extern const char* const HGRAPH_INIT_CAPACITY;
@@ -182,6 +183,17 @@ extern const char* const HGRAPH_BASE_FILE_PATH;
 extern const char* const HGRAPH_PRECISE_IO_TYPE;
 extern const char* const HGRAPH_PRECISE_FILE_PATH;
 extern const char* const HGRAPH_PARAMETER_EF_RUNTIME;
+// CSPG 第一阶段候选池大小（ef1）
+extern const char* const HGRAPH_PARAMETER_CSPG_EF1;
+// CSPG 第二阶段候选池大小（ef2）
+extern const char* const HGRAPH_PARAMETER_CSPG_EF2;
+extern const char* const HGRAPH_PARAMETER_CSPG_PHASE1_PARTITION_COUNT;
+extern const char* const HGRAPH_PARAMETER_CSPG_PHASE1_USE_ROUTE_DESCENT;
+extern const char* const HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_HOPS_LIMIT;
+extern const char* const HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_SWITCH_LIMIT;
+extern const char* const HGRAPH_PARAMETER_CSPG_RECURSIVE_FANOUT_BOUND_SLACK_PERCENT;
+extern const char* const HGRAPH_PARAMETER_CSPG_LOCAL_ROUTING_BUDGET;
+extern const char* const HGRAPH_PARAMETER_CSPG_ENABLE_STATS;
 extern const char* const HGRAPH_PARAMETER_HOPS_LIMIT;
 extern const char* const HGRAPH_EXTRA_INFO_SIZE;
 extern const char* const HGRAPH_SUPPORT_DUPLICATE;

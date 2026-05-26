@@ -38,6 +38,46 @@ public:
         j["is_timeout"].SetBool(is_timeout.load(std::memory_order_relaxed));
         j["dist_cmp"].SetInt(dist_cmp.load(std::memory_order_relaxed));
         j["hops"].SetInt(hops.load(std::memory_order_relaxed));
+        if (enable_cspg_stats.load(std::memory_order_relaxed)) {
+            j["cspg_phase1_dist_cmp"].SetInt(
+                cspg_phase1_dist_cmp.load(std::memory_order_relaxed));
+            j["cspg_phase1_hops"].SetInt(cspg_phase1_hops.load(std::memory_order_relaxed));
+            j["cspg_stage2_dist_cmp"].SetInt(
+                cspg_stage2_dist_cmp.load(std::memory_order_relaxed));
+            j["cspg_stage2_hops"].SetInt(cspg_stage2_hops.load(std::memory_order_relaxed));
+            j["cspg_stage2_local_dist_cmp"].SetInt(
+                cspg_stage2_local_dist_cmp.load(std::memory_order_relaxed));
+            j["cspg_stage2_cross_partition_dist_cmp"].SetInt(
+                cspg_stage2_cross_partition_dist_cmp.load(std::memory_order_relaxed));
+            j["cspg_stage2_local_routing_dist_cmp"].SetInt(
+                cspg_stage2_local_routing_dist_cmp.load(std::memory_order_relaxed));
+            j["cspg_stage2_local_nonrouting_dist_cmp"].SetInt(
+                cspg_stage2_local_nonrouting_dist_cmp.load(std::memory_order_relaxed));
+            j["cspg_stage2_routing_pops"].SetInt(
+                cspg_stage2_routing_pops.load(std::memory_order_relaxed));
+            j["cspg_stage2_nonrouting_pops"].SetInt(
+                cspg_stage2_nonrouting_pops.load(std::memory_order_relaxed));
+            j["cspg_stage2_routing_useless_pops"].SetInt(
+                cspg_stage2_routing_useless_pops.load(std::memory_order_relaxed));
+            j["cspg_stage2_nonrouting_useless_pops"].SetInt(
+                cspg_stage2_nonrouting_useless_pops.load(std::memory_order_relaxed));
+            j["cspg_stage2_routing_fanout_attempts"].SetInt(
+                cspg_stage2_routing_fanout_attempts.load(std::memory_order_relaxed));
+            j["cspg_stage2_routing_fanout_enqueues"].SetInt(
+                cspg_stage2_routing_fanout_enqueues.load(std::memory_order_relaxed));
+            j["cspg_stage2_routing_fanout_skipped_unexpandable"].SetInt(
+                cspg_stage2_routing_fanout_skipped_unexpandable.load(std::memory_order_relaxed));
+            j["cspg_stage2_routing_fanout_skipped_no_unvisited"].SetInt(
+                cspg_stage2_routing_fanout_skipped_no_unvisited.load(std::memory_order_relaxed));
+            j["cspg_stage2_routing_fanout_skipped_duplicate_state"].SetInt(
+                cspg_stage2_routing_fanout_skipped_duplicate_state.load(
+                    std::memory_order_relaxed));
+            j["cspg_stage2_routing_fanout_skipped_frontier_reject"].SetInt(
+                cspg_stage2_routing_fanout_skipped_frontier_reject.load(
+                    std::memory_order_relaxed));
+            j["cspg_stage2_routing_fanout_skipped_by_bound"].SetInt(
+                cspg_stage2_routing_fanout_skipped_by_bound.load(std::memory_order_relaxed));
+        }
         j["io_cnt"].SetInt(io_cnt.load(std::memory_order_relaxed));
         j["io_time_ms"].SetInt(io_time_ms.load(std::memory_order_relaxed));
         return j.Dump();
@@ -45,8 +85,28 @@ public:
 
 public:
     std::atomic<bool> is_timeout{false};
+    std::atomic<bool> enable_cspg_stats{false};
     std::atomic<uint32_t> dist_cmp{0};
     std::atomic<uint32_t> hops{0};
+    std::atomic<uint32_t> cspg_phase1_dist_cmp{0};
+    std::atomic<uint32_t> cspg_phase1_hops{0};
+    std::atomic<uint32_t> cspg_stage2_dist_cmp{0};
+    std::atomic<uint32_t> cspg_stage2_hops{0};
+    std::atomic<uint32_t> cspg_stage2_local_dist_cmp{0};
+    std::atomic<uint32_t> cspg_stage2_cross_partition_dist_cmp{0};
+    std::atomic<uint32_t> cspg_stage2_local_routing_dist_cmp{0};
+    std::atomic<uint32_t> cspg_stage2_local_nonrouting_dist_cmp{0};
+    std::atomic<uint32_t> cspg_stage2_routing_pops{0};
+    std::atomic<uint32_t> cspg_stage2_nonrouting_pops{0};
+    std::atomic<uint32_t> cspg_stage2_routing_useless_pops{0};
+    std::atomic<uint32_t> cspg_stage2_nonrouting_useless_pops{0};
+    std::atomic<uint32_t> cspg_stage2_routing_fanout_attempts{0};
+    std::atomic<uint32_t> cspg_stage2_routing_fanout_enqueues{0};
+    std::atomic<uint32_t> cspg_stage2_routing_fanout_skipped_unexpandable{0};
+    std::atomic<uint32_t> cspg_stage2_routing_fanout_skipped_no_unvisited{0};
+    std::atomic<uint32_t> cspg_stage2_routing_fanout_skipped_duplicate_state{0};
+    std::atomic<uint32_t> cspg_stage2_routing_fanout_skipped_frontier_reject{0};
+    std::atomic<uint32_t> cspg_stage2_routing_fanout_skipped_by_bound{0};
     std::atomic<uint32_t> io_cnt{0};
     std::atomic<uint32_t> io_time_ms{0};
 };

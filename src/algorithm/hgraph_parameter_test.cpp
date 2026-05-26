@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <cmath>
 
 #include "parameter_test.h"
 
@@ -54,6 +55,9 @@ struct HGraphDefaultParam {
     bool use_attribute_filter = false;
     bool support_duplicate = false;
     bool use_reorder = true;
+    int cspg_m = 1;
+    float cspg_lambda = 0.5F;
+    int cspg_partition_max_degree = 0;
 };
 
 std::string
@@ -107,7 +111,10 @@ generate_hgraph_param(const HGraphDefaultParam& param) {
         "type": "hgraph",
         "use_attribute_filter": {},
         "use_reorder": {},
-        "support_duplicate": {}
+        "support_duplicate": {},
+        "cspg_m": {},
+        "cspg_lambda": {},
+        "cspg_partition_max_degree": {}
     }})";
 
     return fmt::format(param_str,
@@ -122,40 +129,187 @@ generate_hgraph_param(const HGraphDefaultParam& param) {
                        param.precise_codes_quantization_type,
                        param.use_attribute_filter,
                        param.use_reorder,
-                       param.support_duplicate);
+                       param.support_duplicate,
+                       param.cspg_m,
+                       param.cspg_lambda,
+                       param.cspg_partition_max_degree);
 }
 
-TEST_CASE("HGraph Parameters CheckCompatibility", "[ut][HGraphParameter][CheckCompatibility]") {
-    SECTION("wrong parameter type") {
+TEST_CASE("HGraph Parameters CheckCompatibility", "[ut][HGraphParameter][CheckCompatibility]"){
+    SECTION("cspg disabled by default"){vsag::HGraphParameter param;
+REQUIRE(param.cspg_m == 1);
+REQUIRE(std::abs(param.cspg_lambda - 0.5F) < 1e-6F);
+REQUIRE(param.cspg_partition_max_degree == 0);
+}
+
+SECTION("wrong parameter type") {
+    HGraphDefaultParam default_param;
+    auto param_str = generate_hgraph_param(default_param);
+    auto param = std::make_shared<vsag::HGraphParameter>();
+    param->FromString(param_str);
+    REQUIRE(param->CheckCompatibility(param));
+    REQUIRE_FALSE(param->CheckCompatibility(std::make_shared<vsag::EmptyParameter>()));
+}
+
+TEST_COMPATIBILITY_CASE(
+    "different base codes io type", base_codes_io_type, "memory_io", "block_memory_io", true)
+TEST_COMPATIBILITY_CASE("different pq dim", base_codes_pq_dim, 8, 16, false)
+TEST_COMPATIBILITY_CASE(
+    "different base codes quantization type", base_codes_quantization_type, "sq4", "sq8", false)
+TEST_COMPATIBILITY_CASE("different graph type", graph_storage_type, "flat", "compressed", false)
+TEST_COMPATIBILITY_CASE("different max degree", max_degree, 26, 30, false)
+TEST_COMPATIBILITY_CASE("different support remove", support_remove, true, false, false)
+TEST_COMPATIBILITY_CASE("different remove flag bit", remove_flag_bit, 8, 16, false)
+TEST_COMPATIBILITY_CASE("different use reorder", use_reorder, true, false, false)
+TEST_COMPATIBILITY_CASE(
+    "different precise codes io type", precise_codes_io_type, "memory_io", "block_memory_io", true)
+TEST_COMPATIBILITY_CASE("different precise codes quantization type",
+                        precise_codes_quantization_type,
+                        "fp32",
+                        "sq8",
+                        false)
+TEST_COMPATIBILITY_CASE("different use attribute filter", use_attribute_filter, true, false, false)
+TEST_COMPATIBILITY_CASE("different support duplicate", support_duplicate, true, false, false)
+TEST_COMPATIBILITY_CASE("different cspg_m", cspg_m, 2, 4, false)
+TEST_COMPATIBILITY_CASE("different cspg_lambda", cspg_lambda, 0.5F, 0.3F, false)
+TEST_COMPATIBILITY_CASE(
+    "different cspg_partition_max_degree", cspg_partition_max_degree, 16, 24, false)
+}
+
+TEST_CASE("HGraph Parameters ResolveCspgPartitionMaxDegree", "[ut][HGraphParameter][ResolveCspgPartitionMaxDegree]") {
+    SECTION("keep explicit partition degree") {
         HGraphDefaultParam default_param;
-        auto param_str = generate_hgraph_param(default_param);
+        default_param.max_degree = 32;
+        default_param.cspg_m = 2;
+        default_param.cspg_lambda = 0.5F;
+        default_param.cspg_partition_max_degree = 28;
         auto param = std::make_shared<vsag::HGraphParameter>();
-        param->FromString(param_str);
-        REQUIRE(param->CheckCompatibility(param));
-        REQUIRE_FALSE(param->CheckCompatibility(std::make_shared<vsag::EmptyParameter>()));
+        param->FromString(generate_hgraph_param(default_param));
+        REQUIRE(param->ResolveCspgPartitionMaxDegree() == 28);
     }
 
-    TEST_COMPATIBILITY_CASE(
-        "different base codes io type", base_codes_io_type, "memory_io", "block_memory_io", true)
-    TEST_COMPATIBILITY_CASE("different pq dim", base_codes_pq_dim, 8, 16, false)
-    TEST_COMPATIBILITY_CASE(
-        "different base codes quantization type", base_codes_quantization_type, "sq4", "sq8", false)
-    TEST_COMPATIBILITY_CASE("different graph type", graph_storage_type, "flat", "compressed", false)
-    TEST_COMPATIBILITY_CASE("different max degree", max_degree, 26, 30, false)
-    TEST_COMPATIBILITY_CASE("different support remove", support_remove, true, false, false)
-    TEST_COMPATIBILITY_CASE("different remove flag bit", remove_flag_bit, 8, 16, false)
-    TEST_COMPATIBILITY_CASE("different use reorder", use_reorder, true, false, false)
-    TEST_COMPATIBILITY_CASE("different precise codes io type",
-                            precise_codes_io_type,
-                            "memory_io",
-                            "block_memory_io",
-                            true)
-    TEST_COMPATIBILITY_CASE("different precise codes quantization type",
-                            precise_codes_quantization_type,
-                            "fp32",
-                            "sq8",
-                            false)
-    TEST_COMPATIBILITY_CASE(
-        "different use attribute filter", use_attribute_filter, true, false, false)
-    TEST_COMPATIBILITY_CASE("different support duplicate", support_duplicate, true, false, false)
+    SECTION("scale default partition degree by partition size ratio") {
+        HGraphDefaultParam default_param;
+        default_param.max_degree = 32;
+        default_param.cspg_m = 2;
+        default_param.cspg_lambda = 0.5F;
+        default_param.cspg_partition_max_degree = 0;
+        auto param = std::make_shared<vsag::HGraphParameter>();
+        param->FromString(generate_hgraph_param(default_param));
+        REQUIRE(param->ResolveCspgPartitionMaxDegree() == 24);
+    }
+
+    SECTION("disable scaling when cspg is off") {
+        HGraphDefaultParam default_param;
+        default_param.max_degree = 32;
+        default_param.cspg_m = 1;
+        default_param.cspg_partition_max_degree = 0;
+        auto param = std::make_shared<vsag::HGraphParameter>();
+        param->FromString(generate_hgraph_param(default_param));
+        REQUIRE(param->ResolveCspgPartitionMaxDegree() == 32);
+    }
+}
+
+TEST_CASE("HGraph Search Parameters Parse CSPG", "[ut][HGraphParameter][Search]") {
+    SECTION("parse cspg ef1") {
+        auto params =
+            vsag::HGraphSearchParameters::FromJson(R"({"hgraph":{"ef_search":60,"cspg_ef1":1}})");
+        REQUIRE(params.ef_search == 60);
+        REQUIRE(params.cspg_ef1 == 1);
+        REQUIRE(params.cspg_ef2 == 0);
+    }
+
+    SECTION("parse cspg ef2") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30}})");
+        REQUIRE(params.ef_search == 60);
+        REQUIRE(params.cspg_ef1 == 1);
+        REQUIRE(params.cspg_ef2 == 30);
+        REQUIRE(params.cspg_phase1_partition_count == 1);
+        REQUIRE_FALSE(params.cspg_enable_stats);
+    }
+
+    SECTION("parse cspg phase1 partition count") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_phase1_partition_count":2}})");
+        REQUIRE(params.cspg_phase1_partition_count == 2);
+        REQUIRE(params.cspg_phase1_use_route_descent);
+    }
+
+    SECTION("parse cspg phase1 route descent") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_phase1_use_route_descent":true}})");
+        REQUIRE(params.cspg_phase1_use_route_descent);
+    }
+
+    SECTION("parse cspg disable phase1 route descent") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_phase1_use_route_descent":false}})");
+        REQUIRE_FALSE(params.cspg_phase1_use_route_descent);
+    }
+
+    SECTION("parse cspg cross partition hops limit") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_cross_partition_hops_limit":2}})");
+        REQUIRE(params.cspg_cross_partition_hops_limit == 2);
+    }
+
+    SECTION("parse cspg cross partition switch limit") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_cross_partition_switch_limit":1}})");
+        REQUIRE(params.cspg_cross_partition_switch_limit == 1);
+    }
+
+    SECTION("parse cspg recursive fanout bound slack percent") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_recursive_fanout_bound_slack_percent":75}})");
+        REQUIRE(params.cspg_recursive_fanout_bound_slack_percent == 75);
+    }
+
+    SECTION("parse cspg stats switch") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_enable_stats":true}})");
+        REQUIRE(params.cspg_enable_stats);
+    }
+
+    SECTION("parse cspg local routing budget") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_local_routing_budget":4}})");
+        REQUIRE(params.cspg_local_routing_budget == 4);
+    }
+
+    SECTION("reject invalid cspg ef1") {
+        REQUIRE_THROWS(
+            vsag::HGraphSearchParameters::FromJson(R"({"hgraph":{"ef_search":60,"cspg_ef1":0}})"));
+    }
+
+    SECTION("reject invalid cspg ef2") {
+        REQUIRE_THROWS(vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":0}})"));
+    }
+
+    SECTION("reject invalid cspg phase1 partition count") {
+        REQUIRE_THROWS(vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_phase1_partition_count":0}})"));
+    }
+
+    SECTION("reject invalid cspg cross partition hops limit") {
+        REQUIRE_THROWS(vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_cross_partition_hops_limit":-1}})"));
+    }
+
+    SECTION("reject invalid cspg cross partition switch limit") {
+        REQUIRE_THROWS(vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_cross_partition_switch_limit":-1}})"));
+    }
+
+    SECTION("reject invalid cspg recursive fanout bound slack percent") {
+        REQUIRE_THROWS(vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_recursive_fanout_bound_slack_percent":101}})"));
+    }
+
+    SECTION("reject invalid cspg local routing budget") {
+        REQUIRE_THROWS(vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_local_routing_budget":-1}})"));
+    }
 }

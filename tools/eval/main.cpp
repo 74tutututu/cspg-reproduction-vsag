@@ -84,6 +84,10 @@ parse_args(argparse::ArgumentParser& parser, int argc, char** argv) {
         .default_value(0.5f)
         .help("The range value for range search or range_filter search")
         .scan<'f', float>();
+    parser.add_argument("--build-base-limit")
+        .default_value(static_cast<uint64_t>(0))
+        .help("Build with only the first N base vectors; 0 means all base vectors")
+        .scan<'i', uint64_t>();
     parser.add_argument("--search-query-count")
         .default_value(100000)
         .help("The number of queries to run for search performance evaluation")

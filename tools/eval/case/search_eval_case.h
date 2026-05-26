@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "../monitor/monitor.h"
 #include "./eval_case.h"
 
@@ -67,6 +69,9 @@ private:
     void
     do_range_filter_search();
 
+    void
+    collect_search_stats(const vsag::DatasetPtr& result);
+
     JsonType
     process_result();
 
@@ -76,5 +81,28 @@ private:
     SearchType search_type_{SearchType::KNN};
 
     EvalConfig config_;
+
+    std::atomic<uint64_t> total_dist_cmp_{0};
+    std::atomic<uint64_t> total_hops_{0};
+    std::atomic<uint64_t> total_stat_samples_{0};
+    std::atomic<uint64_t> total_cspg_phase1_dist_cmp_{0};
+    std::atomic<uint64_t> total_cspg_phase1_hops_{0};
+    std::atomic<uint64_t> total_cspg_stage2_dist_cmp_{0};
+    std::atomic<uint64_t> total_cspg_stage2_hops_{0};
+    std::atomic<uint64_t> total_cspg_stage2_local_dist_cmp_{0};
+    std::atomic<uint64_t> total_cspg_stage2_cross_partition_dist_cmp_{0};
+    std::atomic<uint64_t> total_cspg_stage2_local_routing_dist_cmp_{0};
+    std::atomic<uint64_t> total_cspg_stage2_local_nonrouting_dist_cmp_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_pops_{0};
+    std::atomic<uint64_t> total_cspg_stage2_nonrouting_pops_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_useless_pops_{0};
+    std::atomic<uint64_t> total_cspg_stage2_nonrouting_useless_pops_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_fanout_attempts_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_fanout_enqueues_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_fanout_skipped_unexpandable_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_fanout_skipped_no_unvisited_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_fanout_skipped_duplicate_state_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_fanout_skipped_frontier_reject_{0};
+    std::atomic<uint64_t> total_cspg_stage2_routing_fanout_skipped_by_bound_{0};
 };
 }  // namespace vsag::eval

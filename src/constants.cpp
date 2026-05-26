@@ -147,6 +147,7 @@ const char* const HGRAPH_IGNORE_REORDER = "ignore_reorder";
 const char* const HGRAPH_BUILD_BY_BASE_QUANTIZATION = "build_by_base";
 const char* const HGRAPH_BASE_QUANTIZATION_TYPE = "base_quantization_type";
 const char* const HGRAPH_GRAPH_MAX_DEGREE = "max_degree";
+const char* const HGRAPH_CSPG_PARTITION_MAX_DEGREE = "cspg_partition_max_degree";
 const char* const HGRAPH_BUILD_EF_CONSTRUCTION = "ef_construction";
 const char* const HGRAPH_BUILD_ALPHA = "alpha";
 const char* const HGRAPH_INIT_CAPACITY = "hgraph_init_capacity";
@@ -162,6 +163,22 @@ const char* const HGRAPH_BASE_FILE_PATH = "base_file_path";
 const char* const HGRAPH_PRECISE_IO_TYPE = "precise_io_type";
 const char* const HGRAPH_PRECISE_FILE_PATH = "precise_file_path";
 const char* const HGRAPH_PARAMETER_EF_RUNTIME = "ef_search";
+// CSPG 第一阶段候选池大小（ef1）
+const char* const HGRAPH_PARAMETER_CSPG_EF1 = "cspg_ef1";
+// CSPG 第二阶段候选池大小（ef2）
+const char* const HGRAPH_PARAMETER_CSPG_EF2 = "cspg_ef2";
+const char* const HGRAPH_PARAMETER_CSPG_PHASE1_PARTITION_COUNT =
+    "cspg_phase1_partition_count";
+const char* const HGRAPH_PARAMETER_CSPG_PHASE1_USE_ROUTE_DESCENT =
+    "cspg_phase1_use_route_descent";
+const char* const HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_HOPS_LIMIT =
+    "cspg_cross_partition_hops_limit";
+const char* const HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_SWITCH_LIMIT =
+    "cspg_cross_partition_switch_limit";
+const char* const HGRAPH_PARAMETER_CSPG_RECURSIVE_FANOUT_BOUND_SLACK_PERCENT =
+    "cspg_recursive_fanout_bound_slack_percent";
+const char* const HGRAPH_PARAMETER_CSPG_LOCAL_ROUTING_BUDGET = "cspg_local_routing_budget";
+const char* const HGRAPH_PARAMETER_CSPG_ENABLE_STATS = "cspg_enable_stats";
 const char* const HGRAPH_PARAMETER_HOPS_LIMIT = "hops_limit";
 const char* const HGRAPH_EXTRA_INFO_SIZE = "extra_info_size";
 const char* const HGRAPH_SUPPORT_DUPLICATE = "support_duplicate";

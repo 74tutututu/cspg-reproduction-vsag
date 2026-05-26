@@ -56,6 +56,11 @@ void
 BuildEvalCase::do_build() {
     auto base = vsag::Dataset::Make();
     int64_t total_base = this->dataset_ptr_->GetNumberOfBase();
+    if (config_.build_base_limit > 0) {
+        total_base =
+            std::min<int64_t>(total_base, static_cast<int64_t>(config_.build_base_limit));
+    }
+    built_base_count_ = total_base;
     std::vector<int64_t> ids(total_base);
     std::iota(ids.begin(), ids.end(), 0);
     base->NumElements(total_base)->Dim(this->dataset_ptr_->GetDim())->Ids(ids.data())->Owner(false);
@@ -100,8 +105,9 @@ BuildEvalCase::process_result() {
         EvalCase::MergeJsonType(one_result, eval_result);
     }
     result = eval_result;
-    result["tps"] = double(this->dataset_ptr_->GetNumberOfBase()) / double(result["duration(s)"]);
+    result["tps"] = double(built_base_count_) / double(result["duration(s)"]);
     EvalCase::MergeJsonType(this->basic_info_, result);
+    result["dataset_info"]["base_count"] = built_base_count_;
     result["index_info"] = JsonType::parse(config_.build_param);
     result["action"] = "build";
     result["index"] = config_.index_name;

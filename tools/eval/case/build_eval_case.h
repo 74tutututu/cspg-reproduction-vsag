@@ -49,5 +49,6 @@ private:
     std::vector<MonitorPtr> monitors_{};
 
     EvalConfig config_;
+    int64_t built_base_count_{0};
 };
 }  // namespace vsag::eval

@@ -1,0 +1,22 @@
+global:
+    exporters:
+      print-directly:
+        format: "table"
+        to: "stdout"
+      save-to-file:
+        format: "json"
+        to: "file:///tmp/vsag_eval_data/cspg_auto_sparse_fullscale_lowthread.json"
+
+cspg_auto_sparse_fullscale_lowthread:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5}}'
+    search_params: '{"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":55}}'
+    index_path: "./index/hgraph_cspg_auto_sparse_index_fresh"
+    search_mode: "knn"
+    topk: 10
+    range: 0.5
+    search_query_limit: 10000
+    delete_index_after_search: false
+    num_threads_searching: 2

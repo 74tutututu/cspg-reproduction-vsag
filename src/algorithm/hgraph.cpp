@@ -18,8 +18,11 @@
 #include <datacell/compressed_graph_datacell_parameter.h>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <memory>
+#include <queue>
 #include <stdexcept>
 
 #include "algorithm/inner_index_interface.h"
@@ -45,12 +48,98 @@
 #include "vsag/options.h"
 
 namespace vsag {
+namespace {
+
+constexpr int kCspgRoutingPartition = -1;
+constexpr int kCspgUnassignedPartition = -2;
+constexpr uint32_t kCspgVisitPrefetchStride = 3;
+
+GraphInterfaceParamPtr
+clone_graph_param_with_max_degree(const GraphInterfaceParamPtr& source, uint64_t max_degree) {
+    if (source == nullptr) {
+        return nullptr;
+    }
+    auto json = source->ToJson();
+    json[HGRAPH_GRAPH_MAX_DEGREE].SetInt(static_cast<int64_t>(max_degree));
+    return GraphInterfaceParameter::GetGraphParameterByJson(source->graph_storage_type_, json);
+}
+
+SparseGraphDatacellParamPtr
+clone_sparse_graph_param_with_max_degree(const SparseGraphDatacellParamPtr& source,
+                                         uint64_t max_degree) {
+    auto cloned = std::make_shared<SparseGraphDatacellParameter>();
+    if (source != nullptr) {
+        cloned->support_delete_ = source->support_delete_;
+        cloned->remove_flag_bit_ = source->remove_flag_bit_;
+    }
+    cloned->max_degree_ = max_degree;
+    return cloned;
+}
+
+// CSPG 阶段 1 分区过滤器：仅允许同分区或路由点通过。
+class CspgPartitionFilter : public Filter {
+public:
+    CspgPartitionFilter(const std::vector<int>* partitions, int partition_id)
+        : partitions_(partitions), partition_id_(partition_id) {
+    }
+
+    [[nodiscard]] bool
+    CheckValid(int64_t id) const override {
+        if (partitions_ == nullptr || id < 0 || static_cast<size_t>(id) >= partitions_->size()) {
+            return false;
+        }
+        int partition = (*partitions_)[static_cast<size_t>(id)];
+        // 路由点(-1)或同分区点允许通过。
+        return partition == kCspgRoutingPartition || partition == partition_id_;
+    }
+
+private:
+    const std::vector<int>* partitions_{nullptr};
+    int partition_id_{0};
+};
+
+std::vector<InnerIdType>
+BuildCspgPartitionEntryPoints(const std::vector<int>& partitions, int partition_count) {
+    std::vector<InnerIdType> entry_points(std::max(1, partition_count), INVALID_ENTRY_POINT);
+    InnerIdType routing_entry = INVALID_ENTRY_POINT;
+
+    for (size_t id = 0; id < partitions.size(); ++id) {
+        const int partition = partitions[id];
+        if (partition == kCspgRoutingPartition) {
+            if (routing_entry == INVALID_ENTRY_POINT) {
+                routing_entry = static_cast<InnerIdType>(id);
+            }
+            continue;
+        }
+
+        if (partition >= 0 && static_cast<size_t>(partition) < entry_points.size() &&
+            entry_points[partition] == INVALID_ENTRY_POINT) {
+            entry_points[partition] = static_cast<InnerIdType>(id);
+        }
+    }
+
+    if (routing_entry != INVALID_ENTRY_POINT) {
+        for (auto& entry_point : entry_points) {
+            if (entry_point == INVALID_ENTRY_POINT) {
+                entry_point = routing_entry;
+            }
+        }
+    }
+
+    return entry_points;
+}
+
+}  // namespace
+}  // namespace vsag
+
+namespace vsag {
 
 class HGraphAnalyzer;
 
 HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonParam& common_param)
     : InnerIndexInterface(hgraph_param, common_param),
       route_graphs_(common_param.allocator_.get()),
+      cspg_partition_graphs_(common_param.allocator_.get()),
       use_elp_optimizer_(hgraph_param->use_elp_optimizer),
       ignore_reorder_(hgraph_param->ignore_reorder),
       build_by_base_(hgraph_param->build_by_base),
@@ -58,6 +147,7 @@ HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonPa
       alpha_(hgraph_param->alpha),
       odescent_param_(hgraph_param->odescent_param),
       graph_type_(hgraph_param->graph_type),
+      bottom_graph_param_(hgraph_param->bottom_graph_param),
       hierarchical_datacell_param_(hgraph_param->hierarchical_graph_param),
       use_old_serial_format_(common_param.use_old_serial_format_) {
     this->label_table_->compress_duplicate_data_ = hgraph_param->support_duplicate;
@@ -91,11 +181,31 @@ HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonPa
     check_and_init_raw_vector(hgraph_param->raw_vector_param, common_param);
     resize(bottom_graph_->max_capacity_);
 
-    //从参数对象读取并赋值给成员变量
+    // 从参数对象读取 CSPG 参数，影响分区与路由点比例。
     this->cspg_m_ = hgraph_param->cspg_m;
     this->cspg_lambda_ = hgraph_param->cspg_lambda;
+    const auto cspg_partition_max_degree =
+        static_cast<uint64_t>(hgraph_param->ResolveCspgPartitionMaxDegree());
+    this->cspg_partition_graph_param_ =
+        clone_graph_param_with_max_degree(this->bottom_graph_param_, cspg_partition_max_degree);
+    this->cspg_partition_hierarchical_datacell_param_ = clone_sparse_graph_param_with_max_degree(
+        this->hierarchical_datacell_param_, std::max<uint64_t>(1, cspg_partition_max_degree / 2));
+    this->cspg_partition_entry_points_.assign(std::max(1, this->cspg_m_), INVALID_ENTRY_POINT);
+    this->cspg_partition_route_entry_points_.assign(std::max(1, this->cspg_m_),
+                                                    INVALID_ENTRY_POINT);
+    this->cspg_partition_route_entry_levels_.assign(std::max(1, this->cspg_m_), -1);
+    this->staged_node_partition_.assign(this->max_capacity_.load(), kCspgUnassignedPartition);
 
-    printf("DEBUG: CSPG_M = %d, CSPG_LAMBDA = %f\n", this->cspg_m_, this->cspg_lambda_);
+    this->common_param_.metric_ = common_param.metric_;
+    this->common_param_.data_type_ = common_param.data_type_;
+    this->common_param_.dim_ = common_param.dim_;
+    this->common_param_.extra_info_size_ = common_param.extra_info_size_;
+    this->common_param_.allocator_ = common_param.allocator_;
+    this->common_param_.thread_pool_ = common_param.thread_pool_;
+    this->common_param_.use_old_serial_format_ = common_param.use_old_serial_format_;
+
+    this->ensure_cspg_partition_graphs();
+    this->ensure_cspg_partition_route_graphs();
 }
 void
 HGraph::Train(const DatasetPtr& base) {
@@ -137,6 +247,8 @@ HGraph::map_hgraph_param(const JsonType& hgraph_json) {
         {"cspg_m", {"cspg_m"}},
 
         {"cspg_lambda", {"cspg_lambda"}},
+
+        {HGRAPH_CSPG_PARTITION_MAX_DEGREE, {HGRAPH_CSPG_PARTITION_MAX_DEGREE}},
 
         {
             HGRAPH_USE_REORDER,
@@ -696,6 +808,7 @@ HGraph::build_by_odescent(const DatasetPtr& data) {
 std::vector<int64_t>
 HGraph::Add(const DatasetPtr& data, AddMode mode) {
     std::vector<int64_t> failed_ids;
+    bool is_initial_build = (this->GetNumElements() == 0);
     auto base_dim = data->GetDim();
     if (data_type_ != DataTypes::DATA_TYPE_SPARSE) {
         CHECK_ARGUMENT(base_dim == dim_,
@@ -753,6 +866,26 @@ HGraph::Add(const DatasetPtr& data, AddMode mode) {
             std::scoped_lock label_lock(this->label_lookup_mutex_);
             this->label_table_->Insert(inner_id, labels[j]);
             inner_ids.emplace_back(inner_id, j);
+        }
+    }
+    if (is_initial_build && this->is_cspg_enabled() && !inner_ids.empty()) {
+        // 先按论文里的比例一次性采样 routing vectors，再给剩余向量随机分区。
+        std::vector<size_t> order(inner_ids.size());
+        for (size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::mt19937 generator(std::random_device{}());
+        std::shuffle(order.begin(), order.end(), generator);
+        const size_t routing_count = static_cast<size_t>(std::floor(
+            static_cast<double>(inner_ids.size()) * static_cast<double>(this->cspg_lambda_)));
+        std::uniform_int_distribution<int> partition_dist(0, std::max(1, this->cspg_m_) - 1);
+        for (size_t rank = 0; rank < order.size(); ++rank) {
+            auto inner_id = inner_ids[order[rank]].first;
+            if (rank < routing_count) {
+                this->staged_node_partition_[inner_id] = kCspgRoutingPartition;
+            } else {
+                this->staged_node_partition_[inner_id] = partition_dist(generator);
+            }
         }
     }
     for (auto& [inner_id, local_idx] : inner_ids) {
@@ -1012,6 +1145,201 @@ HGraph::generate_one_route_graph() {
     return std::make_shared<SparseGraphDataCell>(hierarchical_datacell_param_, this->allocator_);
 }
 
+GraphInterfacePtr
+HGraph::generate_one_partition_graph() {
+    auto graph_param = this->cspg_partition_graph_param_ != nullptr
+                           ? this->cspg_partition_graph_param_
+                           : this->bottom_graph_param_;
+    return GraphInterface::MakeInstance(graph_param, this->common_param_);
+}
+
+GraphInterfacePtr
+HGraph::generate_one_partition_route_graph() {
+    auto graph_param = this->cspg_partition_hierarchical_datacell_param_ != nullptr
+                           ? this->cspg_partition_hierarchical_datacell_param_
+                           : this->hierarchical_datacell_param_;
+    return std::make_shared<SparseGraphDataCell>(graph_param, this->allocator_);
+}
+
+void
+HGraph::ensure_cspg_partition_graphs() {
+    if (not this->is_cspg_enabled()) {
+        this->cspg_partition_graphs_.clear();
+        return;
+    }
+
+    auto partition_count = static_cast<size_t>(std::max(1, this->cspg_m_));
+    while (this->cspg_partition_graphs_.size() < partition_count) {
+        auto graph = this->generate_one_partition_graph();
+        graph->Resize(this->max_capacity_.load());
+        this->cspg_partition_graphs_.emplace_back(graph);
+    }
+}
+
+void
+HGraph::ensure_cspg_partition_route_graphs() {
+    if (not this->is_cspg_enabled()) {
+        this->cspg_partition_route_graphs_.clear();
+        this->cspg_partition_route_entry_points_.clear();
+        this->cspg_partition_route_entry_levels_.clear();
+        return;
+    }
+
+    auto partition_count = static_cast<size_t>(std::max(1, this->cspg_m_));
+    while (this->cspg_partition_route_graphs_.size() < partition_count) {
+        this->cspg_partition_route_graphs_.emplace_back();
+    }
+    this->cspg_partition_route_entry_points_.resize(partition_count, INVALID_ENTRY_POINT);
+    this->cspg_partition_route_entry_levels_.resize(partition_count, -1);
+}
+
+void
+HGraph::ensure_cspg_partition_route_levels(int partition_id, size_t level_count) {
+    this->ensure_cspg_partition_route_graphs();
+    if (partition_id < 0 ||
+        static_cast<size_t>(partition_id) >= this->cspg_partition_route_graphs_.size()) {
+        return;
+    }
+    auto& route_graphs = this->cspg_partition_route_graphs_[static_cast<size_t>(partition_id)];
+    while (route_graphs.size() < level_count) {
+        auto graph = this->generate_one_partition_route_graph();
+        graph->Resize(this->max_capacity_.load());
+        route_graphs.emplace_back(graph);
+    }
+}
+
+GraphInterfacePtr
+HGraph::get_cspg_partition_graph(int partition_id) const {
+    if (partition_id < 0 ||
+        static_cast<size_t>(partition_id) >= this->cspg_partition_graphs_.size()) {
+        return nullptr;
+    }
+    return this->cspg_partition_graphs_[partition_id];
+}
+
+GraphInterfacePtr
+HGraph::get_cspg_partition_route_graph(int partition_id, int level) const {
+    if (partition_id < 0 || level < 0 ||
+        static_cast<size_t>(partition_id) >= this->cspg_partition_route_graphs_.size()) {
+        return nullptr;
+    }
+    const auto& route_graphs =
+        this->cspg_partition_route_graphs_[static_cast<size_t>(partition_id)];
+    if (static_cast<size_t>(level) >= route_graphs.size()) {
+        return nullptr;
+    }
+    return route_graphs[static_cast<size_t>(level)];
+}
+
+size_t
+HGraph::get_cspg_partition_route_level_count(int partition_id) const {
+    if (partition_id < 0 ||
+        static_cast<size_t>(partition_id) >= this->cspg_partition_route_graphs_.size()) {
+        return 0;
+    }
+    return this->cspg_partition_route_graphs_[static_cast<size_t>(partition_id)].size();
+}
+
+std::vector<int>
+HGraph::get_cspg_target_partitions(int assigned_partition) const {
+    std::vector<int> target_partitions;
+    if (assigned_partition == kCspgRoutingPartition) {
+        target_partitions.reserve(static_cast<size_t>(std::max(1, this->cspg_m_)));
+        for (int partition = 0; partition < std::max(1, this->cspg_m_); ++partition) {
+            target_partitions.emplace_back(partition);
+        }
+        return target_partitions;
+    }
+    if (assigned_partition >= 0 && assigned_partition < std::max(1, this->cspg_m_)) {
+        target_partitions.emplace_back(assigned_partition);
+    }
+    return target_partitions;
+}
+
+InnerIdType
+HGraph::find_cspg_partition_route_entry(int partition_id, int* level) const {
+    if (level != nullptr) {
+        *level = -1;
+    }
+    if (partition_id < 0 ||
+        static_cast<size_t>(partition_id) >= this->cspg_partition_route_graphs_.size()) {
+        return INVALID_ENTRY_POINT;
+    }
+
+    const auto& route_graphs =
+        this->cspg_partition_route_graphs_[static_cast<size_t>(partition_id)];
+    for (int current_level = static_cast<int>(route_graphs.size()) - 1; current_level >= 0;
+         --current_level) {
+        const auto& graph = route_graphs[static_cast<size_t>(current_level)];
+        if (graph == nullptr || graph->TotalCount() == 0) {
+            continue;
+        }
+        if (static_cast<size_t>(partition_id) < this->cspg_partition_route_entry_points_.size()) {
+            auto entry =
+                this->cspg_partition_route_entry_points_[static_cast<size_t>(partition_id)];
+            if (entry != INVALID_ENTRY_POINT && graph->CheckIdExists(entry)) {
+                if (level != nullptr) {
+                    *level = current_level;
+                }
+                return entry;
+            }
+        }
+        auto ids = graph->GetIds();
+        if (!ids.empty()) {
+            if (level != nullptr) {
+                *level = current_level;
+            }
+            return ids[0];
+        }
+    }
+    return INVALID_ENTRY_POINT;
+}
+
+void
+HGraph::rebuild_cspg_partition_route_entries() {
+    if (not this->is_cspg_enabled()) {
+        this->cspg_partition_route_entry_points_.clear();
+        this->cspg_partition_route_entry_levels_.clear();
+        return;
+    }
+
+    auto partition_count = static_cast<size_t>(std::max(1, this->cspg_m_));
+    this->cspg_partition_route_entry_points_.assign(partition_count, INVALID_ENTRY_POINT);
+    this->cspg_partition_route_entry_levels_.assign(partition_count, -1);
+    for (size_t partition_id = 0; partition_id < partition_count; ++partition_id) {
+        int level = -1;
+        auto entry = this->find_cspg_partition_route_entry(static_cast<int>(partition_id), &level);
+        this->cspg_partition_route_entry_points_[partition_id] = entry;
+        this->cspg_partition_route_entry_levels_[partition_id] = level;
+    }
+}
+
+InnerIdType
+HGraph::choose_any_cspg_entry_point() const {
+    for (auto entry : this->cspg_partition_route_entry_points_) {
+        if (entry != INVALID_ENTRY_POINT) {
+            return entry;
+        }
+    }
+    for (auto entry : this->cspg_partition_entry_points_) {
+        if (entry != INVALID_ENTRY_POINT) {
+            return entry;
+        }
+    }
+    for (size_t partition_id = 0; partition_id < this->cspg_partition_graphs_.size();
+         ++partition_id) {
+        auto graph = this->cspg_partition_graphs_[partition_id];
+        if (graph == nullptr) {
+            continue;
+        }
+        auto ids = graph->GetIds();
+        if (!ids.empty()) {
+            return ids[0];
+        }
+    }
+    return INVALID_ENTRY_POINT;
+}
+
 template <InnerSearchMode mode>
 DistHeapPtr
 HGraph::search_one_graph(const void* query,
@@ -1219,6 +1547,18 @@ HGraph::deserialize_basic_info_v0_14(StreamReader& reader) {
 JsonType
 HGraph::serialize_basic_info() const {
     JsonType jsonify_basic_info;
+    const bool write_cspg_partition = this->is_cspg_enabled();
+    const bool write_cspg_partition_graphs =
+        write_cspg_partition && !this->cspg_partition_graphs_.empty();
+    bool write_cspg_partition_route_graphs = false;
+    if (write_cspg_partition) {
+        for (const auto& route_graphs : this->cspg_partition_route_graphs_) {
+            if (!route_graphs.empty()) {
+                write_cspg_partition_route_graphs = true;
+                break;
+            }
+        }
+    }
     jsonify_basic_info["use_reorder"].SetBool(this->use_reorder_);
     jsonify_basic_info["dim"].SetInt(this->dim_);
     jsonify_basic_info["metric"].SetInt(static_cast<int64_t>(this->metric_));
@@ -1226,6 +1566,10 @@ HGraph::serialize_basic_info() const {
     jsonify_basic_info["ef_construct"].SetInt(this->ef_construct_);
     jsonify_basic_info["extra_info_size"].SetInt(this->extra_info_size_);
     jsonify_basic_info["data_type"].SetInt(static_cast<int64_t>(this->data_type_));
+    // 仅在显式启用 CSPG 时写入分区相关数据，避免污染普通 HGraph 序列化格式。
+    jsonify_basic_info["cspg_partition"].SetBool(write_cspg_partition);
+    jsonify_basic_info["cspg_partition_graphs"].SetBool(write_cspg_partition_graphs);
+    jsonify_basic_info["cspg_partition_route_graphs"].SetBool(write_cspg_partition_route_graphs);
     // logger::debug("mult: {}", this->mult_);
     TO_JSON_BASE64(jsonify_basic_info, mult);
     jsonify_basic_info["max_capacity"].SetInt(this->max_capacity_.load());
@@ -1347,6 +1691,24 @@ HGraph::Serialize(StreamWriter& writer) const {
     this->serialize_label_info(writer);
     this->basic_flatten_codes_->Serialize(writer);
     this->bottom_graph_->Serialize(writer);
+    if (this->is_cspg_enabled()) {
+        // 写入 CSPG 分区数组，确保显式开启时索引复现一致。
+        StreamWriter::WriteVector(writer, this->node_partition_);
+        uint64_t partition_graph_count = this->cspg_partition_graphs_.size();
+        StreamWriter::WriteObj(writer, partition_graph_count);
+        for (const auto& partition_graph : this->cspg_partition_graphs_) {
+            partition_graph->Serialize(writer);
+        }
+        uint64_t partition_route_graph_count = this->cspg_partition_route_graphs_.size();
+        StreamWriter::WriteObj(writer, partition_route_graph_count);
+        for (const auto& route_graphs : this->cspg_partition_route_graphs_) {
+            uint64_t level_count = route_graphs.size();
+            StreamWriter::WriteObj(writer, level_count);
+            for (const auto& route_graph : route_graphs) {
+                route_graph->Serialize(writer);
+            }
+        }
+    }
     if (this->use_reorder_) {
         this->high_precise_codes_->Serialize(writer);
     }
@@ -1396,6 +1758,9 @@ HGraph::Deserialize(StreamReader& reader) {
         this->neighbors_mutex_->Resize(new_size);
 
         pool_ = std::make_shared<VisitedListPool>(1, allocator_, new_size, allocator_);
+        // 老版本序列化没有分区信息，默认全部设为路由点占位。
+        this->node_partition_.assign(new_size, kCspgRoutingPartition);
+        this->staged_node_partition_.assign(new_size, kCspgUnassignedPartition);
 
         if (this->extra_info_size_ > 0 && this->extra_infos_ != nullptr) {
             this->extra_infos_->Deserialize(reader);
@@ -1413,11 +1778,65 @@ HGraph::Deserialize(StreamReader& reader) {
 
         auto metadata = footer->GetMetadata();
         // metadata should NOT be nullptr if footer is not nullptr
-        this->deserialize_basic_info(metadata->Get(BASIC_INFO));
+        auto basic_info = metadata->Get(BASIC_INFO);
+        this->deserialize_basic_info(basic_info);
         this->deserialize_label_info(buffer_reader);
 
         this->basic_flatten_codes_->Deserialize(buffer_reader);
         this->bottom_graph_->Deserialize(buffer_reader);
+        const bool has_cspg_partition =
+            basic_info.Contains("cspg_partition") && basic_info["cspg_partition"].GetBool();
+        const bool has_cspg_partition_route_graphs =
+            basic_info.Contains("cspg_partition_route_graphs") &&
+            basic_info["cspg_partition_route_graphs"].GetBool();
+        // 根据元数据判断是否包含 CSPG 分区数组。
+        if (has_cspg_partition) {
+            StreamReader::ReadVector(buffer_reader, this->node_partition_);
+            uint64_t partition_graph_count = 0;
+            StreamReader::ReadObj(buffer_reader, partition_graph_count);
+            this->cspg_partition_graphs_.clear();
+            for (uint64_t i = 0; i < partition_graph_count; ++i) {
+                auto partition_graph = this->generate_one_partition_graph();
+                partition_graph->Deserialize(buffer_reader);
+                this->cspg_partition_graphs_.emplace_back(partition_graph);
+            }
+            if (has_cspg_partition_route_graphs) {
+                uint64_t partition_route_graph_count = 0;
+                StreamReader::ReadObj(buffer_reader, partition_route_graph_count);
+                this->cspg_partition_route_graphs_.clear();
+                this->cspg_partition_route_graphs_.resize(partition_route_graph_count);
+                for (uint64_t partition_id = 0; partition_id < partition_route_graph_count;
+                     ++partition_id) {
+                    uint64_t level_count = 0;
+                    StreamReader::ReadObj(buffer_reader, level_count);
+                    auto& route_graphs = this->cspg_partition_route_graphs_[partition_id];
+                    route_graphs.clear();
+                    route_graphs.reserve(level_count);
+                    for (uint64_t level = 0; level < level_count; ++level) {
+                        auto route_graph = this->generate_one_partition_route_graph();
+                        route_graph->Deserialize(buffer_reader);
+                        route_graphs.emplace_back(route_graph);
+                    }
+                }
+            } else {
+                this->cspg_partition_route_graphs_.clear();
+            }
+        } else {
+            this->node_partition_.assign(this->max_capacity_.load(), kCspgUnassignedPartition);
+            this->cspg_partition_graphs_.clear();
+            this->cspg_partition_route_graphs_.clear();
+        }
+        this->staged_node_partition_.assign(this->max_capacity_.load(), kCspgUnassignedPartition);
+        if (this->is_cspg_enabled()) {
+            this->cspg_partition_entry_points_ =
+                BuildCspgPartitionEntryPoints(this->node_partition_, this->cspg_m_);
+            this->ensure_cspg_partition_route_graphs();
+            this->rebuild_cspg_partition_route_entries();
+        } else {
+            this->cspg_partition_entry_points_.clear();
+            this->cspg_partition_route_entry_points_.clear();
+            this->cspg_partition_route_entry_levels_.clear();
+        }
         if (this->use_reorder_) {
             this->high_precise_codes_->Deserialize(buffer_reader);
         }
@@ -1470,6 +1889,22 @@ HGraph::GetMemoryUsageDetail() const {
         route_graph_size += route_graph->CalcSerializeSize();
     }
     memory_usage["route_graph"].SetInt(route_graph_size);
+    uint64_t cspg_partition_graph_size = 0;
+    for (const auto& graph : this->cspg_partition_graphs_) {
+        if (graph != nullptr) {
+            cspg_partition_graph_size += graph->CalcSerializeSize();
+        }
+    }
+    memory_usage["cspg_partition_graph"].SetInt(cspg_partition_graph_size);
+    uint64_t cspg_partition_route_graph_size = 0;
+    for (const auto& route_graphs : this->cspg_partition_route_graphs_) {
+        for (const auto& graph : route_graphs) {
+            if (graph != nullptr) {
+                cspg_partition_route_graph_size += graph->CalcSerializeSize();
+            }
+        }
+    }
+    memory_usage["cspg_partition_route_graph"].SetInt(cspg_partition_route_graph_size);
     if (this->extra_info_size_ > 0 && this->extra_infos_ != nullptr) {
         memory_usage["extra_infos"].SetInt(this->extra_infos_->CalcSerializeSize());
     }
@@ -1536,33 +1971,89 @@ HGraph::add_one_point(const void* data, int level, InnerIdType inner_id) {
         }
     }
 
-    // CSPG:定分区归属
-    {
-        // 使用 thread_local 保证每个线程有自己独立的随机生成器，线程安全
-        thread_local std::mt19937 local_gen(std::random_device{}());
-        std::uniform_real_distribution<float> dist(0.0, 1.0);
-        
-        float rand_val = dist(local_gen);
-        // node_partition_ 已经在 resize 提前扩容，这里是单点按索引写入，天然安全
-        if (rand_val < cspg_lambda_) {
-            node_partition_[inner_id] = -1; // -1 代表它是超脱于分区的“全局路由点”
-        } else {
-            node_partition_[inner_id] = inner_id % cspg_m_; // 简单均匀分配到 0~m-1
+    // CSPG：优先使用批量建图阶段预采样的分区；若没有预采样，则沿用随机分配。
+    if (this->is_cspg_enabled()) {
+        int assigned_partition = kCspgUnassignedPartition;
+        if (static_cast<size_t>(inner_id) < this->staged_node_partition_.size()) {
+            assigned_partition = this->staged_node_partition_[inner_id];
+            this->staged_node_partition_[inner_id] = kCspgUnassignedPartition;
         }
+        if (assigned_partition == kCspgUnassignedPartition) {
+            thread_local std::mt19937 local_gen(std::random_device{}());
+            std::uniform_real_distribution<float> routing_dist(0.0F, 1.0F);
+            int partition_count = std::max(1, this->cspg_m_);
+            std::uniform_int_distribution<int> partition_dist(0, partition_count - 1);
+            float rand_val = routing_dist(local_gen);
+            assigned_partition =
+                rand_val < this->cspg_lambda_ ? kCspgRoutingPartition : partition_dist(local_gen);
+        }
+        node_partition_[inner_id] = assigned_partition;
     }
     // ===================================
 
+    bool enable_cspg = this->is_cspg_enabled() && !this->cspg_partition_graphs_.empty();
+    auto target_partitions = enable_cspg
+                                 ? this->get_cspg_target_partitions(node_partition_[inner_id])
+                                 : std::vector<int>{};
+    bool need_full_lock =
+        this->entry_point_id_ == INVALID_ENTRY_POINT ||
+        (not enable_cspg && (level >= static_cast<int>(this->route_graphs_.size()) ||
+                             bottom_graph_->TotalCount() == 0));
+    if (enable_cspg) {
+        for (int partition_id : target_partitions) {
+            if (level >=
+                static_cast<int>(this->get_cspg_partition_route_level_count(partition_id))) {
+                need_full_lock = true;
+                break;
+            }
+        }
+    }
+
     std::unique_lock add_lock(add_mutex_);
-    if (level >= static_cast<int>(this->route_graphs_.size()) || bottom_graph_->TotalCount() == 0) {
+    if (enable_cspg) {
+        if (this->cspg_partition_entry_points_.empty()) {
+            this->cspg_partition_entry_points_.assign(std::max(1, this->cspg_m_),
+                                                      INVALID_ENTRY_POINT);
+        }
+        if (node_partition_[inner_id] == kCspgRoutingPartition) {
+            for (auto& entry_point : this->cspg_partition_entry_points_) {
+                if (entry_point == INVALID_ENTRY_POINT) {
+                    entry_point = inner_id;
+                }
+            }
+        } else if (node_partition_[inner_id] >= 0 &&
+                   static_cast<size_t>(node_partition_[inner_id]) <
+                       this->cspg_partition_entry_points_.size()) {
+            auto& entry_point = this->cspg_partition_entry_points_[node_partition_[inner_id]];
+            if (entry_point == INVALID_ENTRY_POINT) {
+                entry_point = inner_id;
+            }
+        }
+    }
+    if (need_full_lock) {
+        auto old_route_graph_count = this->route_graphs_.size();
+        bool created_new_route_graph = false;
         std::scoped_lock<std::shared_mutex> wlock(this->global_mutex_);
-        // level maybe a negative number(-1)
-        for (auto j = static_cast<int>(this->route_graphs_.size()); j <= level; ++j) {
-            this->route_graphs_.emplace_back(this->generate_one_route_graph());
+        if (enable_cspg) {
+            for (int partition_id : target_partitions) {
+                this->ensure_cspg_partition_route_levels(
+                    partition_id, static_cast<size_t>(std::max(level + 1, 0)));
+            }
+        } else {
+            // level maybe a negative number(-1)
+            for (auto j = static_cast<int>(this->route_graphs_.size()); j <= level; ++j) {
+                this->route_graphs_.emplace_back(this->generate_one_route_graph());
+                created_new_route_graph = true;
+            }
         }
         auto insert_success = this->graph_add_one(data, level, inner_id);
-        if (insert_success) {
+        if (insert_success && enable_cspg) {
+            this->entry_point_id_ = this->choose_any_cspg_entry_point();
+        } else if (insert_success && (this->entry_point_id_ == INVALID_ENTRY_POINT ||
+                                      level >= static_cast<int>(old_route_graph_count))) {
             entry_point_id_ = inner_id;
-        } else {
+        }
+        if (not insert_success && created_new_route_graph) {
             this->route_graphs_.pop_back();
         }
         add_lock.unlock();
@@ -1587,77 +2078,143 @@ HGraph::graph_add_one(const void* data, int level, InnerIdType inner_id) {
         flatten_codes = high_precise_codes_;
     }
 
-    for (auto j = this->route_graphs_.size() - 1; j > level; --j) {
-        result = search_one_graph(
-            data, route_graphs_[j], flatten_codes, param, (VisitedListPtr) nullptr, nullptr);
-        param.ep = result->Top().second;
-    }
-
-    param.ef = this->ef_construct_;
-    param.topk = static_cast<int64_t>(ef_construct_);
-    if (this->label_table_->CompressDuplicateData()) {
-        param.find_duplicate = true;
-    }
-
-    if (bottom_graph_->TotalCount() != 0) {
-        result = search_one_graph(data,
-                                  this->bottom_graph_,
-                                  flatten_codes,
-                                  param,
-                                  // to specify which overloaded function to call
-                                  (VisitedListPtr) nullptr,
-                                  nullptr);
-        if (this->label_table_->CompressDuplicateData() && param.duplicate_id >= 0) {
-            std::unique_lock lock(this->label_lookup_mutex_);
-            label_table_->SetDuplicateId(static_cast<InnerIdType>(param.duplicate_id), inner_id);
-            return false;
+    bool enable_cspg = this->is_cspg_enabled() && !this->cspg_partition_graphs_.empty();
+    if (!enable_cspg) {
+        for (auto j = this->route_graphs_.size() - 1; j > level; --j) {
+            result = search_one_graph(
+                data, route_graphs_[j], flatten_codes, param, (VisitedListPtr) nullptr, nullptr);
+            param.ep = result->Top().second;
         }
-        auto filtered_result = std::make_shared<StandardHeap<true, false>>(allocator_, -1);
-        while (not result->Empty()) {
-            auto [dist, id] = result->Top();
-            result->Pop();
-            if (id != inner_id) {
-               // 修改：连边
-                bool can_connect = false;
-                
-                // 判断逻辑：如果新来的点或者候选邻居中，只要有一个的分区号是 -1 (路由节点)，就允许连线
-                if (node_partition_[inner_id] == -1 || node_partition_[id] == -1) {
-                    can_connect = true;
-                } 
-                // 否则，两者必须在同一个分区才能连线
-                else if (node_partition_[inner_id] == node_partition_[id]) {
-                    can_connect = true;
-                }
 
-                // 通过规则允许加入后续的 mutually_connect_new_element
-                if (can_connect) {
+        param.ef = this->ef_construct_;
+        param.topk = static_cast<int64_t>(ef_construct_);
+        if (this->label_table_->CompressDuplicateData()) {
+            param.find_duplicate = true;
+        }
+
+        if (bottom_graph_->TotalCount() != 0) {
+            result = search_one_graph(
+                data, this->bottom_graph_, flatten_codes, param, (VisitedListPtr) nullptr, nullptr);
+            if (this->label_table_->CompressDuplicateData() && param.duplicate_id >= 0) {
+                std::unique_lock lock(this->label_lookup_mutex_);
+                label_table_->SetDuplicateId(static_cast<InnerIdType>(param.duplicate_id),
+                                             inner_id);
+                return false;
+            }
+            auto filtered_result = std::make_shared<StandardHeap<true, false>>(allocator_, -1);
+
+            while (not result->Empty()) {
+                auto [dist, id] = result->Top();
+                result->Pop();
+                if (id != inner_id) {
                     filtered_result->Push(dist, id);
                 }
-                // ========================================
+            }
+
+            LockGuard cur_lock(neighbors_mutex_, inner_id);
+            mutually_connect_new_element(inner_id,
+                                         filtered_result,
+                                         this->bottom_graph_,
+                                         flatten_codes,
+                                         neighbors_mutex_,
+                                         allocator_,
+                                         alpha_);
+        } else {
+            LockGuard cur_lock(neighbors_mutex_, inner_id);
+            bottom_graph_->InsertNeighborsById(inner_id, Vector<InnerIdType>(allocator_));
+        }
+
+        for (int64_t j = 0; j <= level; ++j) {
+            if (route_graphs_[j]->TotalCount() != 0) {
+                result = search_one_graph(data,
+                                          route_graphs_[j],
+                                          flatten_codes,
+                                          param,
+                                          (VisitedListPtr) nullptr,
+                                          nullptr);
+                auto filtered_result = std::make_shared<StandardHeap<true, false>>(allocator_, -1);
+                while (not result->Empty()) {
+                    auto [dist, id] = result->Top();
+                    result->Pop();
+                    if (id != inner_id) {
+                        filtered_result->Push(dist, id);
+                    }
+                }
+                LockGuard cur_lock(neighbors_mutex_, inner_id);
+                mutually_connect_new_element(inner_id,
+                                             filtered_result,
+                                             route_graphs_[j],
+                                             flatten_codes,
+                                             neighbors_mutex_,
+                                             allocator_,
+                                             alpha_);
+            } else {
+                LockGuard cur_lock(neighbors_mutex_, inner_id);
+                route_graphs_[j]->InsertNeighborsById(inner_id, Vector<InnerIdType>(allocator_));
             }
         }
-        LockGuard cur_lock(neighbors_mutex_, inner_id);
-        mutually_connect_new_element(inner_id,
-                                     filtered_result,
-                                     this->bottom_graph_,
-                                     flatten_codes,
-                                     neighbors_mutex_,
-                                     allocator_,
-                                     alpha_);
-    } else {
-        LockGuard cur_lock(neighbors_mutex_, inner_id);
-        bottom_graph_->InsertNeighborsById(inner_id, Vector<InnerIdType>(allocator_));
+        return true;
     }
 
-    for (int64_t j = 0; j <= level; ++j) {
-        if (route_graphs_[j]->TotalCount() != 0) {
+    const int assigned_partition = inner_id < this->node_partition_.size()
+                                       ? this->node_partition_[inner_id]
+                                       : kCspgUnassignedPartition;
+    auto target_partitions = this->get_cspg_target_partitions(assigned_partition);
+
+    for (int partition_id : target_partitions) {
+        auto partition_graph = this->get_cspg_partition_graph(partition_id);
+        if (partition_graph == nullptr) {
+            continue;
+        }
+
+        InnerSearchParam partition_param;
+        partition_param.topk = 1;
+        partition_param.ef = 1;
+        partition_param.is_inner_id_allowed = nullptr;
+        int route_entry_level = -1;
+        auto route_entry = this->find_cspg_partition_route_entry(partition_id, &route_entry_level);
+        if (route_entry != INVALID_ENTRY_POINT) {
+            partition_param.ep = route_entry;
+            for (int current_level = route_entry_level; current_level > level; --current_level) {
+                auto route_graph =
+                    this->get_cspg_partition_route_graph(partition_id, current_level);
+                if (route_graph == nullptr || route_graph->TotalCount() == 0) {
+                    continue;
+                }
+                result = search_one_graph(data,
+                                          route_graph,
+                                          flatten_codes,
+                                          partition_param,
+                                          (VisitedListPtr) nullptr,
+                                          nullptr);
+                partition_param.ep = result->Top().second;
+            }
+        } else if (static_cast<size_t>(partition_id) < this->cspg_partition_entry_points_.size() &&
+                   this->cspg_partition_entry_points_[partition_id] != INVALID_ENTRY_POINT) {
+            partition_param.ep = this->cspg_partition_entry_points_[partition_id];
+        } else {
+            partition_param.ep = inner_id;
+        }
+
+        partition_param.ef = this->ef_construct_;
+        partition_param.topk = static_cast<int64_t>(this->ef_construct_);
+        if (this->label_table_->CompressDuplicateData()) {
+            partition_param.find_duplicate = true;
+        }
+
+        if (partition_graph->TotalCount() != 0) {
             result = search_one_graph(data,
-                                      route_graphs_[j],
+                                      partition_graph,
                                       flatten_codes,
-                                      param,
-                                      // to specify which overloaded function to call
+                                      partition_param,
                                       (VisitedListPtr) nullptr,
                                       nullptr);
+            if (this->label_table_->CompressDuplicateData() && partition_param.duplicate_id >= 0) {
+                std::unique_lock lock(this->label_lookup_mutex_);
+                label_table_->SetDuplicateId(static_cast<InnerIdType>(partition_param.duplicate_id),
+                                             inner_id);
+                return false;
+            }
             auto filtered_result = std::make_shared<StandardHeap<true, false>>(allocator_, -1);
             while (not result->Empty()) {
                 auto [dist, id] = result->Top();
@@ -1669,14 +2226,73 @@ HGraph::graph_add_one(const void* data, int level, InnerIdType inner_id) {
             LockGuard cur_lock(neighbors_mutex_, inner_id);
             mutually_connect_new_element(inner_id,
                                          filtered_result,
-                                         route_graphs_[j],
+                                         partition_graph,
                                          flatten_codes,
                                          neighbors_mutex_,
                                          allocator_,
                                          alpha_);
+            if (static_cast<size_t>(partition_id) < this->cspg_partition_entry_points_.size() &&
+                (partition_graph->TotalCount() == 1 ||
+                 partition_graph->GetNeighborSize(inner_id) > 0)) {
+                auto& entry_point = this->cspg_partition_entry_points_[partition_id];
+                const bool is_own_partition =
+                    assigned_partition >= 0 && assigned_partition == partition_id;
+                if (is_own_partition || entry_point == INVALID_ENTRY_POINT) {
+                    entry_point = inner_id;
+                }
+            }
         } else {
             LockGuard cur_lock(neighbors_mutex_, inner_id);
-            route_graphs_[j]->InsertNeighborsById(inner_id, Vector<InnerIdType>(allocator_));
+            partition_graph->InsertNeighborsById(inner_id, Vector<InnerIdType>(allocator_));
+            if (static_cast<size_t>(partition_id) < this->cspg_partition_entry_points_.size()) {
+                auto& entry_point = this->cspg_partition_entry_points_[partition_id];
+                const bool is_own_partition =
+                    assigned_partition >= 0 && assigned_partition == partition_id;
+                if (is_own_partition || entry_point == INVALID_ENTRY_POINT) {
+                    entry_point = inner_id;
+                }
+            }
+        }
+
+        for (int current_level = 0; current_level <= level; ++current_level) {
+            auto route_graph = this->get_cspg_partition_route_graph(partition_id, current_level);
+            if (route_graph == nullptr) {
+                continue;
+            }
+            if (route_graph->TotalCount() != 0) {
+                result = search_one_graph(data,
+                                          route_graph,
+                                          flatten_codes,
+                                          partition_param,
+                                          (VisitedListPtr) nullptr,
+                                          nullptr);
+                auto filtered_result = std::make_shared<StandardHeap<true, false>>(allocator_, -1);
+                while (not result->Empty()) {
+                    auto [dist, id] = result->Top();
+                    result->Pop();
+                    if (id != inner_id) {
+                        filtered_result->Push(dist, id);
+                    }
+                }
+                LockGuard cur_lock(neighbors_mutex_, inner_id);
+                mutually_connect_new_element(inner_id,
+                                             filtered_result,
+                                             route_graph,
+                                             flatten_codes,
+                                             neighbors_mutex_,
+                                             allocator_,
+                                             alpha_);
+            } else {
+                LockGuard cur_lock(neighbors_mutex_, inner_id);
+                route_graph->InsertNeighborsById(inner_id, Vector<InnerIdType>(allocator_));
+            }
+        }
+
+        if (static_cast<size_t>(partition_id) < this->cspg_partition_route_entry_levels_.size() &&
+            static_cast<size_t>(partition_id) < this->cspg_partition_route_entry_points_.size() &&
+            level >= this->cspg_partition_route_entry_levels_[partition_id]) {
+            this->cspg_partition_route_entry_levels_[partition_id] = level;
+            this->cspg_partition_route_entry_points_[partition_id] = inner_id;
         }
     }
     return true;
@@ -1698,9 +2314,24 @@ HGraph::resize(uint64_t new_size) {
         this->label_table_->Resize(new_size_power_2);
         bottom_graph_->Resize(new_size_power_2);
 
-        // ==== 【CSPG 修改：同步扩容我们的分区数组】 ====
-        this->node_partition_.resize(new_size_power_2, -1);
-        // ============================================
+        if (not this->cspg_partition_graphs_.empty()) {
+            for (auto& graph : this->cspg_partition_graphs_) {
+                if (graph != nullptr) {
+                    graph->Resize(new_size_power_2);
+                }
+            }
+        }
+        for (auto& route_graphs : this->cspg_partition_route_graphs_) {
+            for (auto& graph : route_graphs) {
+                if (graph != nullptr) {
+                    graph->Resize(new_size_power_2);
+                }
+            }
+        }
+
+        // CSPG：同步扩容分区数组，保持与图容量一致。
+        this->node_partition_.resize(new_size_power_2, kCspgUnassignedPartition);
+        this->staged_node_partition_.resize(new_size_power_2, kCspgUnassignedPartition);
 
         this->basic_flatten_codes_->Resize(new_size_power_2);
         if (use_reorder_) {
@@ -1714,8 +2345,6 @@ HGraph::resize(uint64_t new_size) {
         }
         this->max_capacity_.store(new_size_power_2);
         this->cal_memory_usage();
-
-        
     }
 }
 void
@@ -1908,7 +2537,7 @@ HGraph::Remove(const std::vector<int64_t>& ids, RemoveMode mode) {
             std::shared_lock lock(this->label_lookup_mutex_);
             inner_id = this->label_table_->GetIdByLabel(id);
         }
-        if (inner_id == this->entry_point_id_) {
+        if (!this->is_cspg_enabled() && inner_id == this->entry_point_id_) {
             bool find_new_ep = false;
             while (not route_graphs_.empty()) {
                 auto& upper_graph = route_graphs_.back();
@@ -1935,10 +2564,50 @@ HGraph::Remove(const std::vector<int64_t>& ids, RemoveMode mode) {
                     this->route_graphs_[level]->DeleteNeighborsById(inner_id);
                 }
                 this->bottom_graph_->DeleteNeighborsById(inner_id);
+                if (this->is_cspg_enabled() && !this->cspg_partition_graphs_.empty()) {
+                    if (inner_id < this->node_partition_.size()) {
+                        const int partition = this->node_partition_[inner_id];
+                        for (auto target_partition : this->get_cspg_target_partitions(partition)) {
+                            if (target_partition < 0 || static_cast<size_t>(target_partition) >=
+                                                            this->cspg_partition_graphs_.size()) {
+                                continue;
+                            }
+                            auto& graph =
+                                this->cspg_partition_graphs_[static_cast<size_t>(target_partition)];
+                            if (graph != nullptr) {
+                                graph->DeleteNeighborsById(inner_id);
+                            }
+                            if (static_cast<size_t>(target_partition) <
+                                this->cspg_partition_route_graphs_.size()) {
+                                for (auto& route_graph :
+                                     this->cspg_partition_route_graphs_[static_cast<size_t>(
+                                         target_partition)]) {
+                                    if (route_graph != nullptr) {
+                                        route_graph->DeleteNeighborsById(inner_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (inner_id < this->node_partition_.size()) {
+                    this->node_partition_[inner_id] = kCspgUnassignedPartition;
+                }
+                if (inner_id < this->staged_node_partition_.size()) {
+                    this->staged_node_partition_[inner_id] = kCspgUnassignedPartition;
+                }
             }
             std::scoped_lock label_lock(this->label_lookup_mutex_);
             this->label_table_->MarkRemove(id);
             delete_count++;
+        }
+        if (this->is_cspg_enabled()) {
+            this->cspg_partition_entry_points_ =
+                BuildCspgPartitionEntryPoints(this->node_partition_, this->cspg_m_);
+            this->rebuild_cspg_partition_route_entries();
+            if (inner_id == this->entry_point_id_) {
+                this->entry_point_id_ = this->choose_any_cspg_entry_point();
+            }
         }
     }
     return delete_count;
@@ -2056,21 +2725,53 @@ HGraph::Merge(const std::vector<MergeUnit>& merge_units) {
     for (const auto& merge_unit : merge_units) {
         const auto other_index = std::dynamic_pointer_cast<HGraph>(
             std::dynamic_pointer_cast<IndexImpl<HGraph>>(merge_unit.index)->GetInnerIndex());
+        CHECK_ARGUMENT(this->cspg_m_ == other_index->cspg_m_ &&
+                           std::abs(this->cspg_lambda_ - other_index->cspg_lambda_) <= 1e-6F,
+                       "cspg parameters must be the same when merging HGraph indexes");
+        CHECK_ARGUMENT(
+            this->cspg_partition_graphs_.empty() == other_index->cspg_partition_graphs_.empty(),
+            "cspg partition graph availability must match when merging HGraph indexes");
+        auto merge_bias = this->total_count_.load();
         if (total_count_ == 0) {
             this->entry_point_id_ = other_index->entry_point_id_;
         }
-        basic_flatten_codes_->MergeOther(other_index->basic_flatten_codes_, this->total_count_);
+        basic_flatten_codes_->MergeOther(other_index->basic_flatten_codes_, merge_bias);
         label_table_->MergeOther(other_index->label_table_, merge_unit.id_map_func);
         if (use_reorder_) {
-            high_precise_codes_->MergeOther(other_index->high_precise_codes_, this->total_count_);
+            high_precise_codes_->MergeOther(other_index->high_precise_codes_, merge_bias);
         }
-        bottom_graph_->MergeOther(other_index->bottom_graph_, this->total_count_);
-        if (route_graphs_.size() < other_index->route_graphs_.size()) {
+        bottom_graph_->MergeOther(other_index->bottom_graph_, merge_bias);
+        while (route_graphs_.size() < other_index->route_graphs_.size()) {
             route_graphs_.push_back(this->generate_one_route_graph());
         }
         for (int j = 0; j < std::min(other_index->route_graphs_.size(), route_graphs_.size());
              ++j) {
-            route_graphs_[j]->MergeOther(other_index->route_graphs_[j], this->total_count_);
+            route_graphs_[j]->MergeOther(other_index->route_graphs_[j], merge_bias);
+        }
+
+        if (this->is_cspg_enabled() && !other_index->cspg_partition_graphs_.empty()) {
+            this->ensure_cspg_partition_graphs();
+            while (this->cspg_partition_graphs_.size() <
+                   other_index->cspg_partition_graphs_.size()) {
+                this->cspg_partition_graphs_.push_back(this->generate_one_partition_graph());
+            }
+            for (int j = 0; j < std::min(other_index->cspg_partition_graphs_.size(),
+                                         this->cspg_partition_graphs_.size());
+                 ++j) {
+                this->cspg_partition_graphs_[j]->MergeOther(other_index->cspg_partition_graphs_[j],
+                                                            merge_bias);
+            }
+            for (InnerIdType i = 0; i < other_index->GetNumElements(); ++i) {
+                InnerIdType target_id = merge_bias + i;
+                if (target_id >= this->node_partition_.size()) {
+                    break;
+                }
+                if (i < other_index->node_partition_.size()) {
+                    this->node_partition_[target_id] = other_index->node_partition_[i];
+                } else {
+                    this->node_partition_[target_id] = kCspgUnassignedPartition;
+                }
+            }
         }
         this->total_count_ += other_index->GetNumElements();
     }
@@ -2101,6 +2802,11 @@ HGraph::Merge(const std::vector<MergeUnit>& merge_units) {
         sparse_odescent_builder.Build(ids, graph);
         sparse_odescent_builder.SaveGraph(graph);
         this->entry_point_id_ = ids.back();
+    }
+    if (this->is_cspg_enabled()) {
+        this->cspg_partition_entry_points_ =
+            BuildCspgPartitionEntryPoints(this->node_partition_, this->cspg_m_);
+        this->staged_node_partition_.assign(this->max_capacity_.load(), kCspgUnassignedPartition);
     }
 }
 
@@ -2157,6 +2863,7 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
     }
 
     auto params = HGraphSearchParameters::FromJson(request.params_str_);
+    stats.enable_cspg_stats.store(params.cspg_enable_stats, std::memory_order_relaxed);
 
     auto ef_search_threshold = std::max<int64_t>(AMPLIFICATION_FACTOR * k, 1000);
     CHECK_ARGUMENT(  // NOLINT
@@ -2187,10 +2894,23 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
     auto vt = this->pool_->TakeOne();
 
     const auto* raw_query = get_data(query);
-    for (auto i = static_cast<int64_t>(this->route_graphs_.size() - 1); i >= 0; --i) {
-        auto result = this->search_one_graph(
-            raw_query, this->route_graphs_[i], this->basic_flatten_codes_, search_param, vt, &ctx);
-        search_param.ep = result->Top().second;
+    const bool has_cspg_partition_graph_data =
+        std::any_of(this->cspg_partition_graphs_.begin(),
+                    this->cspg_partition_graphs_.end(),
+                    [](const GraphInterfacePtr& graph) {
+                        return graph != nullptr && graph->TotalCount() != 0;
+                    });
+    bool enable_cspg = this->is_cspg_enabled() && has_cspg_partition_graph_data;
+    if (!enable_cspg) {
+        for (auto i = static_cast<int64_t>(this->route_graphs_.size() - 1); i >= 0; --i) {
+            auto result = this->search_one_graph(raw_query,
+                                                 this->route_graphs_[i],
+                                                 this->basic_flatten_codes_,
+                                                 search_param,
+                                                 vt,
+                                                 &ctx);
+            search_param.ep = result->Top().second;
+        }
     }
 
     auto combined_filter = std::make_shared<CombinedFilter>();
@@ -2245,10 +2965,697 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
         search_param.hops_limit = params.hops_limit;
     }
 
-    //Algorithm 1 (Line 7-14)
-    auto search_result = this->search_one_graph(
-        raw_query, this->bottom_graph_, this->basic_flatten_codes_, search_param, vt, &ctx);
+    auto search_result = DistHeapPtr{};
 
+    auto choose_entry_point = [&](const GraphInterfacePtr& graph,
+                                  InnerIdType preferred_ep,
+                                  size_t partition_id) -> InnerIdType {
+        if (graph == nullptr || graph->TotalCount() == 0) {
+            return INVALID_ENTRY_POINT;
+        }
+        auto is_expandable_entry = [&](InnerIdType id) -> bool {
+            if (id == INVALID_ENTRY_POINT || !graph->CheckIdExists(id)) {
+                return false;
+            }
+            return graph->TotalCount() == 1 || graph->GetNeighborSize(id) > 0;
+        };
+
+        if (is_expandable_entry(preferred_ep)) {
+            return preferred_ep;
+        }
+        if (partition_id < this->cspg_partition_entry_points_.size()) {
+            auto entry = this->cspg_partition_entry_points_[partition_id];
+            if (is_expandable_entry(entry)) {
+                return entry;
+            }
+        }
+        auto ids = graph->GetIds();
+        for (auto id : ids) {
+            if (is_expandable_entry(id)) {
+                return id;
+            }
+        }
+        if (!ids.empty()) {
+            return ids[0];
+        }
+        return INVALID_ENTRY_POINT;
+    };
+
+    if (enable_cspg) {
+        // CSPG query is split into two stages:
+        // 1) fast approaching within one partition;
+        // 2) cross-partition expansion with a larger candidate set.
+        int64_t ef1 = std::max<int64_t>(1, params.cspg_ef1);
+        const uint64_t ef2 = params.cspg_ef2 > 0
+                                 ? static_cast<uint64_t>(std::max<int64_t>(params.cspg_ef2, k))
+                                 : search_param.ef;
+
+        struct CspgPhase1Seed {
+            float dist;
+            InnerIdType id;
+            size_t partition_id;
+        };
+        std::vector<CspgPhase1Seed> phase1_seeds;
+        uint32_t hops = 0;
+        uint32_t dist_cmp = 0;
+        uint32_t phase1_hops_before = 0;
+        uint32_t phase1_dist_cmp_before = 0;
+        if (ctx.stats != nullptr) {
+            phase1_hops_before = ctx.stats->hops.load(std::memory_order_relaxed);
+            phase1_dist_cmp_before = ctx.stats->dist_cmp.load(std::memory_order_relaxed);
+        }
+
+        std::vector<size_t> phase1_partitions;
+        phase1_partitions.reserve(this->cspg_partition_graphs_.size());
+        for (size_t partition_id = 0; partition_id < this->cspg_partition_graphs_.size();
+             ++partition_id) {
+            auto partition_graph = this->get_cspg_partition_graph(static_cast<int>(partition_id));
+            if (partition_graph != nullptr && partition_graph->TotalCount() != 0) {
+                phase1_partitions.emplace_back(partition_id);
+            }
+        }
+        auto run_phase1_on_partition = [&](size_t partition_id) -> std::pair<InnerIdType, float> {
+            auto partition_graph = this->get_cspg_partition_graph(static_cast<int>(partition_id));
+            if (partition_graph == nullptr || partition_graph->TotalCount() == 0) {
+                return {INVALID_ENTRY_POINT, std::numeric_limits<float>::max()};
+            }
+
+            InnerIdType phase1_preferred_ep = INVALID_ENTRY_POINT;
+            if (params.cspg_phase1_use_route_descent) {
+                int route_entry_level = -1;
+                InnerIdType route_entry = INVALID_ENTRY_POINT;
+                // 这是 HGraph 风格增强路径，不属于论文 Algorithm 1 的默认流程。
+                const auto has_cached_route_entry =
+                    partition_id < this->cspg_partition_route_entry_points_.size() &&
+                    partition_id < this->cspg_partition_route_entry_levels_.size();
+                if (has_cached_route_entry) {
+                    route_entry = this->cspg_partition_route_entry_points_[partition_id];
+                    route_entry_level = this->cspg_partition_route_entry_levels_[partition_id];
+                    const auto has_route_graphs =
+                        partition_id < this->cspg_partition_route_graphs_.size();
+                    const auto cached_level_valid =
+                        route_entry != INVALID_ENTRY_POINT && route_entry_level >= 0 &&
+                        has_route_graphs &&
+                        static_cast<size_t>(route_entry_level) <
+                            this->cspg_partition_route_graphs_[partition_id].size();
+                    if (!cached_level_valid) {
+                        route_entry = INVALID_ENTRY_POINT;
+                        route_entry_level = -1;
+                    } else {
+                        const auto& cached_route_graph =
+                            this->cspg_partition_route_graphs_[partition_id]
+                                                              [static_cast<size_t>(
+                                                                  route_entry_level)];
+                        if (cached_route_graph == nullptr ||
+                            !cached_route_graph->CheckIdExists(route_entry)) {
+                            route_entry = INVALID_ENTRY_POINT;
+                            route_entry_level = -1;
+                        }
+                    }
+                }
+                if (route_entry == INVALID_ENTRY_POINT) {
+                    route_entry = this->find_cspg_partition_route_entry(
+                        static_cast<int>(partition_id), &route_entry_level);
+                }
+                if (route_entry != INVALID_ENTRY_POINT) {
+                    // 可选增强：先沿 partition route graph 自顶向下下降，再进入 phase-1。
+                    InnerSearchParam route_search_param;
+                    route_search_param.ep = route_entry;
+                    route_search_param.topk = 1;
+                    route_search_param.ef = 1;
+                    route_search_param.is_inner_id_allowed = nullptr;
+                    route_search_param.hops_limit = search_param.hops_limit;
+                    route_search_param.time_cost = search_param.time_cost;
+                    route_search_param.parallel_search_thread_count =
+                        search_param.parallel_search_thread_count;
+                    phase1_preferred_ep = route_entry;
+                    const auto* route_graphs =
+                        partition_id < this->cspg_partition_route_graphs_.size()
+                            ? &this->cspg_partition_route_graphs_[partition_id]
+                            : nullptr;
+                    for (int current_level = route_entry_level; current_level >= 0;
+                         --current_level) {
+                        if (route_graphs != nullptr &&
+                            static_cast<size_t>(current_level) < route_graphs->size()) {
+                            auto route_graph = (*route_graphs)[static_cast<size_t>(current_level)];
+                            if (route_graph == nullptr || route_graph->TotalCount() == 0) {
+                                continue;
+                            }
+                            auto route_result = this->search_one_graph(raw_query,
+                                                                       route_graph,
+                                                                       this->basic_flatten_codes_,
+                                                                       route_search_param,
+                                                                       vt,
+                                                                       &ctx);
+                            if (route_result != nullptr && !route_result->Empty()) {
+                                route_search_param.ep = route_result->Top().second;
+                                phase1_preferred_ep = route_search_param.ep;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // phase-1 与 phase-2 之间要重置 visited，保持论文里的两阶段边界清晰。
+            vt->Reset();
+
+            // phase1 只负责给 phase2 产出一个高质量 seed，不在这里维护最终 top-k。
+            const auto phase1_entry =
+                choose_entry_point(partition_graph, phase1_preferred_ep, partition_id);
+            if (phase1_entry != INVALID_ENTRY_POINT) {
+                InnerSearchParam phase1_param = search_param;
+                phase1_param.ep = phase1_entry;
+                phase1_param.ef = std::max<uint64_t>(1, ef1);
+                phase1_param.topk = 1;
+                phase1_param.is_inner_id_allowed = nullptr;
+                phase1_param.consider_duplicate = false;
+
+                auto phase1_result = this->search_one_graph(
+                    raw_query, partition_graph, this->basic_flatten_codes_, phase1_param, vt, &ctx);
+                if (phase1_result != nullptr && !phase1_result->Empty()) {
+                    return {phase1_result->Top().second, phase1_result->Top().first};
+                }
+            }
+            return {INVALID_ENTRY_POINT, std::numeric_limits<float>::max()};
+        };
+
+        // 默认保持论文风格：只在第一个非空 partition 上做 phase-1。
+        // 当该 seed 质量不稳定时，允许按参数探测多个 partition，
+        // 但 phase-2 仍只从最好的单个 seed 开始，避免初始 frontier 过宽。
+        const auto phase1_partition_probe_count = std::min<size_t>(
+            static_cast<size_t>(std::max<int64_t>(1, params.cspg_phase1_partition_count)),
+            phase1_partitions.size());
+        phase1_seeds.reserve(phase1_partition_probe_count);
+        for (size_t i = 0; i < phase1_partition_probe_count; ++i) {
+            const auto partition_id = phase1_partitions[i];
+            vt->Reset();
+            auto [candidate_seed, candidate_dist] = run_phase1_on_partition(partition_id);
+            if (candidate_seed != INVALID_ENTRY_POINT) {
+                phase1_seeds.push_back(
+                    CspgPhase1Seed{candidate_dist, candidate_seed, partition_id});
+            }
+        }
+        std::stable_sort(phase1_seeds.begin(),
+                         phase1_seeds.end(),
+                         [](const CspgPhase1Seed& lhs, const CspgPhase1Seed& rhs) {
+                             if (lhs.dist != rhs.dist) {
+                                 return lhs.dist < rhs.dist;
+                             }
+                             if (lhs.id != rhs.id) {
+                                 return lhs.id < rhs.id;
+                             }
+                             return lhs.partition_id < rhs.partition_id;
+                         });
+        if (ctx.stats != nullptr && params.cspg_enable_stats) {
+            const auto phase1_hops_after = ctx.stats->hops.load(std::memory_order_relaxed);
+            const auto phase1_dist_cmp_after = ctx.stats->dist_cmp.load(std::memory_order_relaxed);
+            ctx.stats->cspg_phase1_hops.fetch_add(phase1_hops_after - phase1_hops_before,
+                                                  std::memory_order_relaxed);
+            ctx.stats->cspg_phase1_dist_cmp.fetch_add(
+                phase1_dist_cmp_after - phase1_dist_cmp_before, std::memory_order_relaxed);
+        }
+        vt->Reset();
+
+        auto computer = this->basic_flatten_codes_->FactoryComputer(raw_query);
+
+        struct CspgState {
+            float dist;
+            InnerIdType id;
+            size_t partition_id;
+            bool from_cross_partition;
+            uint16_t cross_partition_depth;
+            uint16_t cross_partition_switches;
+        };
+        struct CspgStateCompare {
+            bool
+            operator()(const CspgState& a, const CspgState& b) const {
+                if (a.dist != b.dist) {
+                    return a.dist < b.dist;
+                }
+                if (a.id != b.id) {
+                    return a.id < b.id;
+                }
+                if (a.partition_id != b.partition_id) {
+                    return a.partition_id < b.partition_id;
+                }
+                if (a.from_cross_partition != b.from_cross_partition) {
+                    return a.from_cross_partition < b.from_cross_partition;
+                }
+                if (a.cross_partition_depth != b.cross_partition_depth) {
+                    return a.cross_partition_depth < b.cross_partition_depth;
+                }
+                return a.cross_partition_switches < b.cross_partition_switches;
+            }
+        };
+        struct CspgStateWorseFirstCompare {
+            bool
+            operator()(const CspgState& a, const CspgState& b) const {
+                if (a.dist != b.dist) {
+                    return a.dist > b.dist;
+                }
+                if (a.id != b.id) {
+                    return a.id > b.id;
+                }
+                if (a.partition_id != b.partition_id) {
+                    return a.partition_id > b.partition_id;
+                }
+                if (a.from_cross_partition != b.from_cross_partition) {
+                    return a.from_cross_partition > b.from_cross_partition;
+                }
+                if (a.cross_partition_depth != b.cross_partition_depth) {
+                    return a.cross_partition_depth > b.cross_partition_depth;
+                }
+                return a.cross_partition_switches > b.cross_partition_switches;
+            }
+        };
+        // Keep only the active stage-2 states in a bounded ordered frontier.
+        // The best state is kept at the back so pop is O(1) on the hot path.
+        Vector<CspgState> frontier(ctx.alloc);
+        const auto frontier_hint =
+            static_cast<size_t>(std::max<uint64_t>(16, std::min<uint64_t>(ef2, 4096)));
+        frontier.reserve(frontier_hint);
+        auto stage2_results =
+            DistanceHeap::MakeInstanceBySize<true, true>(ctx.alloc, static_cast<int64_t>(ef2));
+        const bool collect_cspg_stats = ctx.stats != nullptr && params.cspg_enable_stats;
+        uint32_t stage2_routing_pops = 0;
+        uint32_t stage2_nonrouting_pops = 0;
+        uint32_t stage2_routing_useless_pops = 0;
+        uint32_t stage2_nonrouting_useless_pops = 0;
+        uint32_t stage2_local_dist_cmp = 0;
+        uint32_t stage2_cross_partition_dist_cmp = 0;
+        uint32_t stage2_local_routing_dist_cmp = 0;
+        uint32_t stage2_local_nonrouting_dist_cmp = 0;
+        uint32_t stage2_routing_fanout_attempts = 0;
+        uint32_t stage2_routing_fanout_enqueues = 0;
+        uint32_t stage2_routing_fanout_skipped_unexpandable = 0;
+        uint32_t stage2_routing_fanout_skipped_no_unvisited = 0;
+        uint32_t stage2_routing_fanout_skipped_duplicate_state = 0;
+        uint32_t stage2_routing_fanout_skipped_frontier_reject = 0;
+        uint32_t stage2_routing_fanout_skipped_by_bound = 0;
+        const auto partition_count = this->cspg_partition_graphs_.size();
+
+        auto current_bound = [&]() {
+            // Once we already keep ef2 results, the current worst result becomes a
+            // global pruning bound for both frontier expansion and neighbor insertion.
+            if (stage2_results->Size() < ef2 || stage2_results->Empty()) {
+                return std::numeric_limits<float>::max();
+            }
+            return stage2_results->Top().first;
+        };
+        float best_result_dist = std::numeric_limits<float>::max();
+
+        CspgStateCompare state_less;
+        CspgStateWorseFirstCompare state_worse_first;
+        auto trim_frontier = [&]() {
+            if (frontier.size() > ef2) {
+                frontier.erase(frontier.begin());
+            }
+        };
+
+        auto enqueue_state = [&](InnerIdType id,
+                                 size_t partition_id,
+                                 float dist,
+                                 bool from_cross_partition = false,
+                                 uint16_t cross_partition_depth = 0,
+                                 uint16_t cross_partition_switches = 0) -> bool {
+            if (id == INVALID_ENTRY_POINT) {
+                return false;
+            }
+            auto state = CspgState{dist,
+                                   id,
+                                   partition_id,
+                                   from_cross_partition,
+                                   cross_partition_depth,
+                                   cross_partition_switches};
+            if (!frontier.empty() && frontier.size() >= ef2) {
+                if (!state_less(state, frontier.front())) {
+                    return false;
+                }
+            }
+            auto insert_it =
+                std::lower_bound(frontier.begin(), frontier.end(), state, state_worse_first);
+            frontier.insert(insert_it, state);
+            trim_frontier();
+            return true;
+        };
+
+        auto consider_result = [&](InnerIdType id, float dist) -> bool {
+            if (search_param.is_inner_id_allowed != nullptr &&
+                !search_param.is_inner_id_allowed->CheckValid(id)) {
+                return false;
+            }
+            if (stage2_results->Size() >= ef2 && dist >= stage2_results->Top().first) {
+                return false;
+            }
+            stage2_results->Push(dist, id);
+            if (dist < best_result_dist) {
+                best_result_dist = dist;
+            }
+            return true;
+        };
+
+        auto is_cspg_routing_vector = [&](InnerIdType id) -> bool {
+            return id >= 0 && static_cast<size_t>(id) < this->node_partition_.size() &&
+                   this->node_partition_[static_cast<size_t>(id)] == kCspgRoutingPartition;
+        };
+
+        const auto partition_max_degree =
+            !this->cspg_partition_graphs_.empty() && this->cspg_partition_graphs_[0] != nullptr
+                ? this->cspg_partition_graphs_[0]->MaximumDegree()
+                : this->bottom_graph_->MaximumDegree();
+        Vector<InnerIdType> neighbors(ctx.alloc);
+        Vector<InnerIdType> routing_neighbors(ctx.alloc);
+        Vector<InnerIdType> candidate_neighbors(ctx.alloc);
+        Vector<float> line_dists(ctx.alloc);
+        UnorderedSet<uint64_t> seen_cross_partition_routing_states(ctx.alloc);
+        neighbors.reserve(partition_max_degree);
+        routing_neighbors.reserve(partition_max_degree);
+        candidate_neighbors.resize(partition_max_degree);
+        line_dists.resize(partition_max_degree);
+        seen_cross_partition_routing_states.reserve(frontier_hint * std::max<size_t>(partition_count, 1));
+
+        if (!phase1_seeds.empty()) {
+            const auto& phase1_seed = phase1_seeds.front();
+            enqueue_state(phase1_seed.id, phase1_seed.partition_id, phase1_seed.dist, false, 0, 0);
+            if (!vt->Get(phase1_seed.id)) {
+                vt->Set(phase1_seed.id);
+                consider_result(phase1_seed.id, phase1_seed.dist);
+            }
+        }
+
+        auto expand_one_partition = [&](const CspgState& current,
+                                        bool current_is_routing,
+                                        bool& current_pop_useful,
+                                        float& result_bound) -> bool {
+            const auto id = current.id;
+            const auto partition_id = current.partition_id;
+            if (partition_id >= this->cspg_partition_graphs_.size()) {
+                return false;
+            }
+            const auto& partition_graph = this->cspg_partition_graphs_[partition_id];
+            if (partition_graph == nullptr || partition_graph->TotalCount() == 0) {
+                return false;
+            }
+            if (current.from_cross_partition && params.cspg_cross_partition_hops_limit > 0 &&
+                current.cross_partition_depth >=
+                    static_cast<uint16_t>(params.cspg_cross_partition_hops_limit)) {
+                return false;
+            }
+
+            neighbors.clear();
+            partition_graph->GetNeighbors(id, neighbors);
+            if (neighbors.empty()) {
+                return false;
+            }
+
+            // 先批量收集未访问邻居，再统一做距离计算，减少逐点 Query 的热路径开销。
+            uint32_t candidate_count = 0;
+            const bool limit_local_routing_neighbors = current.from_cross_partition &&
+                                                       current_is_routing &&
+                                                       params.cspg_local_routing_budget > 0;
+            bool skipped_local_routing_neighbor = false;
+            auto collect_neighbors = [&](bool allow_local_routing_neighbors) {
+                for (size_t i = 0; i < neighbors.size(); ++i) {
+                    auto neighbor = neighbors[i];
+                    if (i + kCspgVisitPrefetchStride < neighbors.size()) {
+                        vt->Prefetch(neighbors[i + kCspgVisitPrefetchStride]);
+                    }
+                    const bool neighbor_is_routing = is_cspg_routing_vector(neighbor);
+                    if (limit_local_routing_neighbors && neighbor_is_routing &&
+                        !allow_local_routing_neighbors) {
+                        skipped_local_routing_neighbor = true;
+                        continue;
+                    }
+                    if (!vt->Get(neighbor)) {
+                        vt->Set(neighbor);
+                        candidate_neighbors[candidate_count++] = neighbor;
+                    }
+                }
+            };
+            collect_neighbors(!limit_local_routing_neighbors);
+            if (limit_local_routing_neighbors && skipped_local_routing_neighbor) {
+                const auto candidate_capacity = static_cast<uint32_t>(candidate_neighbors.size());
+                const uint32_t routing_budget = std::min<uint32_t>(
+                    static_cast<uint32_t>(params.cspg_local_routing_budget),
+                    candidate_capacity > candidate_count ? candidate_capacity - candidate_count
+                                                         : 0);
+                uint32_t added_local_routing_neighbors = 0;
+                for (size_t i = 0;
+                     i < neighbors.size() && added_local_routing_neighbors < routing_budget;
+                     ++i) {
+                    auto neighbor = neighbors[i];
+                    if (!is_cspg_routing_vector(neighbor) || vt->Get(neighbor)) {
+                        continue;
+                    }
+                    vt->Set(neighbor);
+                    candidate_neighbors[candidate_count++] = neighbor;
+                    ++added_local_routing_neighbors;
+                }
+            }
+            if (candidate_count == 0) {
+                return false;
+            }
+
+            this->basic_flatten_codes_->Query(
+                line_dists.data(), computer, candidate_neighbors.data(), candidate_count, &ctx);
+            dist_cmp += candidate_count;
+            if (collect_cspg_stats) {
+                if (current.from_cross_partition) {
+                    stage2_cross_partition_dist_cmp += candidate_count;
+                } else {
+                    stage2_local_dist_cmp += candidate_count;
+                    if (current_is_routing) {
+                        stage2_local_routing_dist_cmp += candidate_count;
+                    } else {
+                        stage2_local_nonrouting_dist_cmp += candidate_count;
+                    }
+                }
+            }
+
+            auto target_partition_has_unvisited_neighbor = [&](
+                                                               const GraphInterfacePtr& target_graph,
+                                                               InnerIdType target_id) {
+                routing_neighbors.clear();
+                target_graph->GetNeighbors(target_id, routing_neighbors);
+                for (auto neighbor : routing_neighbors) {
+                    if (!vt->Get(neighbor)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            auto enqueue_routing_instances = [&](InnerIdType routing_id, float routing_dist) {
+                if (params.cspg_cross_partition_switch_limit > 0 &&
+                    current.cross_partition_switches >=
+                        static_cast<uint16_t>(params.cspg_cross_partition_switch_limit)) {
+                    return false;
+                }
+                if (current.from_cross_partition &&
+                    params.cspg_recursive_fanout_bound_slack_percent > 0 &&
+                    stage2_results->Size() >= ef2 &&
+                    best_result_dist < std::numeric_limits<float>::max()) {
+                    if (result_bound > best_result_dist) {
+                        const float allowed_dist =
+                            best_result_dist +
+                            (result_bound - best_result_dist) *
+                                (static_cast<float>(
+                                     params.cspg_recursive_fanout_bound_slack_percent) /
+                                 100.0F);
+                        if (routing_dist > allowed_dist) {
+                            if (collect_cspg_stats) {
+                                ++stage2_routing_fanout_skipped_by_bound;
+                            }
+                            return false;
+                        }
+                    }
+                }
+                bool inserted_any_state = false;
+                const bool dedupe_cross_partition_routing_state =
+                    params.cspg_cross_partition_switch_limit == 0;
+                for (size_t other_partition = 0; other_partition < partition_count;
+                     ++other_partition) {
+                    if (other_partition == partition_id) {
+                        continue;
+                    }
+                    if (collect_cspg_stats) {
+                        ++stage2_routing_fanout_attempts;
+                    }
+                    const auto& other_graph = this->cspg_partition_graphs_[other_partition];
+                    if (other_graph == nullptr || other_graph->TotalCount() == 0 ||
+                        routing_id == INVALID_ENTRY_POINT ||
+                        !other_graph->CheckIdExists(routing_id)) {
+                        if (collect_cspg_stats) {
+                            ++stage2_routing_fanout_skipped_unexpandable;
+                        }
+                        continue;
+                    }
+                    if (dedupe_cross_partition_routing_state) {
+                        const uint64_t state_key =
+                            (static_cast<uint64_t>(other_partition) << 32) |
+                            static_cast<uint64_t>(routing_id);
+                        if (!seen_cross_partition_routing_states.insert(state_key).second) {
+                            if (collect_cspg_stats) {
+                                ++stage2_routing_fanout_skipped_duplicate_state;
+                            }
+                            continue;
+                        }
+                    }
+                    if (!target_partition_has_unvisited_neighbor(other_graph, routing_id)) {
+                        if (collect_cspg_stats) {
+                            ++stage2_routing_fanout_skipped_no_unvisited;
+                        }
+                        continue;
+                    }
+                    if (enqueue_state(routing_id,
+                                      other_partition,
+                                      routing_dist,
+                                      true,
+                                      0,
+                                      static_cast<uint16_t>(current.cross_partition_switches +
+                                                            1))) {
+                        inserted_any_state = true;
+                        if (collect_cspg_stats) {
+                            ++stage2_routing_fanout_enqueues;
+                        }
+                    } else if (collect_cspg_stats) {
+                        ++stage2_routing_fanout_skipped_frontier_reject;
+                    }
+                }
+                return inserted_any_state;
+            };
+
+            for (uint32_t i = 0; i < candidate_count; ++i) {
+                auto neighbor = candidate_neighbors[i];
+                auto dist = line_dists[i];
+                if (stage2_results->Size() >= ef2 && dist >= result_bound) {
+                    continue;
+                }
+                const bool inserted_into_frontier =
+                    enqueue_state(neighbor,
+                                  partition_id,
+                                  dist,
+                                  current.from_cross_partition,
+                                  current.from_cross_partition
+                                      ? static_cast<uint16_t>(current.cross_partition_depth + 1)
+                                      : 0,
+                                  current.cross_partition_switches);
+                const bool improved_results = consider_result(neighbor, dist);
+                if (collect_cspg_stats) {
+                    current_pop_useful =
+                        current_pop_useful || inserted_into_frontier || improved_results;
+                }
+                if (improved_results) {
+                    result_bound = current_bound();
+                }
+                if (is_cspg_routing_vector(neighbor)) {
+                    const bool inserted_routing_states = enqueue_routing_instances(neighbor, dist);
+                    if (collect_cspg_stats) {
+                        current_pop_useful = current_pop_useful || inserted_routing_states;
+                    }
+                }
+            }
+            return true;
+        };
+
+        // Stage-2 precise search: expand the closest active state, prune by the current
+        // result bound, and cross partitions only when a routing vector is encountered.
+        while (!frontier.empty()) {
+            if (params.hops_limit != std::numeric_limits<uint32_t>::max() &&
+                hops >= params.hops_limit) {
+                break;
+            }
+            if (search_param.time_cost != nullptr && search_param.time_cost->CheckOvertime()) {
+                stats.is_timeout.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            const auto current = frontier.back();
+            if (stage2_results->Size() >= ef2 && current.dist > current_bound()) {
+                break;
+            }
+            frontier.pop_back();
+            ++hops;
+            const bool current_is_routing = is_cspg_routing_vector(current.id);
+            if (collect_cspg_stats) {
+                if (current_is_routing) {
+                    ++stage2_routing_pops;
+                } else {
+                    ++stage2_nonrouting_pops;
+                }
+            }
+            bool current_pop_useful = false;
+            auto finalize_current_pop = [&](bool useful) {
+                if (!collect_cspg_stats) {
+                    return;
+                }
+                if (useful) {
+                    return;
+                }
+                if (current_is_routing) {
+                    ++stage2_routing_useless_pops;
+                } else {
+                    ++stage2_nonrouting_useless_pops;
+                }
+            };
+            if (!frontier.empty()) {
+                const auto& next = frontier.back();
+                if (next.partition_id < this->cspg_partition_graphs_.size()) {
+                    const auto& next_graph = this->cspg_partition_graphs_[next.partition_id];
+                    if (next_graph != nullptr) {
+                        next_graph->Prefetch(next.id, 0);
+                    }
+                }
+                this->basic_flatten_codes_->Prefetch(next.id);
+            }
+            auto result_bound = current_bound();
+            expand_one_partition(current, current_is_routing, current_pop_useful, result_bound);
+            finalize_current_pop(current_pop_useful);
+        }
+        search_result = stage2_results;
+        if (ctx.stats != nullptr) {
+            ctx.stats->hops.fetch_add(hops, std::memory_order_relaxed);
+            ctx.stats->dist_cmp.fetch_add(dist_cmp, std::memory_order_relaxed);
+        }
+        if (collect_cspg_stats) {
+            ctx.stats->cspg_stage2_hops.fetch_add(hops, std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_dist_cmp.fetch_add(dist_cmp, std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_local_dist_cmp.fetch_add(stage2_local_dist_cmp,
+                                                            std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_cross_partition_dist_cmp.fetch_add(
+                stage2_cross_partition_dist_cmp, std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_local_routing_dist_cmp.fetch_add(stage2_local_routing_dist_cmp,
+                                                                    std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_local_nonrouting_dist_cmp.fetch_add(
+                stage2_local_nonrouting_dist_cmp, std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_pops.fetch_add(stage2_routing_pops,
+                                                          std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_nonrouting_pops.fetch_add(stage2_nonrouting_pops,
+                                                             std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_useless_pops.fetch_add(stage2_routing_useless_pops,
+                                                                  std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_nonrouting_useless_pops.fetch_add(stage2_nonrouting_useless_pops,
+                                                                     std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_fanout_attempts.fetch_add(stage2_routing_fanout_attempts,
+                                                                     std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_fanout_enqueues.fetch_add(stage2_routing_fanout_enqueues,
+                                                                     std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_fanout_skipped_unexpandable.fetch_add(
+                stage2_routing_fanout_skipped_unexpandable, std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_fanout_skipped_no_unvisited.fetch_add(
+                stage2_routing_fanout_skipped_no_unvisited, std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_fanout_skipped_duplicate_state.fetch_add(
+                stage2_routing_fanout_skipped_duplicate_state, std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_fanout_skipped_frontier_reject.fetch_add(
+                stage2_routing_fanout_skipped_frontier_reject, std::memory_order_relaxed);
+            ctx.stats->cspg_stage2_routing_fanout_skipped_by_bound.fetch_add(
+                stage2_routing_fanout_skipped_by_bound, std::memory_order_relaxed);
+        }
+    } else {
+        // 未启用 CSPG 时，保持原有单阶段搜索。
+        search_result = this->search_one_graph(
+            raw_query, this->bottom_graph_, this->basic_flatten_codes_, search_param, vt, &ctx);
+    }
     this->pool_->ReturnOne(vt);
 
     if (use_reorder_) {
@@ -2465,6 +3872,14 @@ HGraph::cal_memory_usage() {
     memory += this->label_table_->GetMemoryUsage();
     memory += this->basic_flatten_codes_->GetMemoryUsage();
     memory += this->bottom_graph_->GetMemoryUsage();
+    for (auto& graph : this->cspg_partition_graphs_) {
+        memory += graph->GetMemoryUsage();
+    }
+    for (auto& route_graphs : this->cspg_partition_route_graphs_) {
+        for (auto& graph : route_graphs) {
+            memory += graph->GetMemoryUsage();
+        }
+    }
     for (auto& graph : this->route_graphs_) {
         memory += graph->GetMemoryUsage();
     }
