@@ -138,6 +138,12 @@ HGraphParameter::FromJson(const JsonType& json) {
     if (json.Contains(HGRAPH_CSPG_PARTITION_MAX_DEGREE)) {
         this->cspg_partition_max_degree = json[HGRAPH_CSPG_PARTITION_MAX_DEGREE].GetInt();
     }
+    if (json.Contains(HGRAPH_CSPG_PARTITION_GRAPH_TYPE)) {
+        this->cspg_partition_graph_type = json[HGRAPH_CSPG_PARTITION_GRAPH_TYPE].GetString();
+        CHECK_ARGUMENT(this->cspg_partition_graph_type == GRAPH_TYPE_VALUE_NSW ||
+                           this->cspg_partition_graph_type == GRAPH_TYPE_VALUE_ODESCENT,
+                       "cspg_partition_graph_type must be 'nsw' or 'odescent'");
+    }
     CHECK_ARGUMENT(this->cspg_m > 0, "cspg_m must be greater than 0");
     CHECK_ARGUMENT(this->cspg_lambda >= 0.0F && this->cspg_lambda <= 1.0F,
                    "cspg_lambda must be in range [0.0, 1.0]");
@@ -169,6 +175,7 @@ HGraphParameter::ToJson() const {
     json["cspg_m"].SetInt(this->cspg_m);
     json["cspg_lambda"].SetFloat(this->cspg_lambda);
     json[HGRAPH_CSPG_PARTITION_MAX_DEGREE].SetInt(this->cspg_partition_max_degree);
+    json[HGRAPH_CSPG_PARTITION_GRAPH_TYPE].SetString(this->cspg_partition_graph_type);
     return json;
 }
 
@@ -212,7 +219,8 @@ HGraphParameter::CheckCompatibility(const ParamPtr& other) const {
     }
     if (cspg_m != hgraph_param->cspg_m ||
         std::abs(cspg_lambda - hgraph_param->cspg_lambda) > 1e-6F ||
-        cspg_partition_max_degree != hgraph_param->cspg_partition_max_degree) {
+        cspg_partition_max_degree != hgraph_param->cspg_partition_max_degree ||
+        cspg_partition_graph_type != hgraph_param->cspg_partition_graph_type) {
         logger::error(
             "HGraphParameter::CheckCompatibility: CSPG build parameters must be the same");
         return false;
@@ -226,19 +234,12 @@ HGraphParameter::ResolveCspgPartitionMaxDegree() const {
         return 0;
     }
     const auto bottom_max_degree = this->bottom_graph_param->max_degree_;
-    if (this->cspg_partition_max_degree > 0 || this->cspg_m <= 1) {
-        return this->cspg_partition_max_degree > 0
-                   ? static_cast<uint32_t>(this->cspg_partition_max_degree)
-                   : static_cast<uint32_t>(bottom_max_degree);
+    // 0 = 不指定，使用 bottom graph 相同 max_degree（论文设定：partition graph 与 baseline 保持
+    // 相同图构建参数，由分区规模缩小自然带来路径压缩，而不是人为降度数导致过稀疏）。
+    if (this->cspg_partition_max_degree > 0) {
+        return static_cast<uint32_t>(this->cspg_partition_max_degree);
     }
-
-    const double partition_size_ratio =
-        static_cast<double>(this->cspg_lambda) +
-        (1.0 - static_cast<double>(this->cspg_lambda)) / static_cast<double>(this->cspg_m);
-    const auto scaled_partition_degree = static_cast<uint64_t>(
-        std::llround(static_cast<double>(bottom_max_degree) * partition_size_ratio));
-    return static_cast<uint32_t>(
-        std::clamp<uint64_t>(scaled_partition_degree, 1, bottom_max_degree));
+    return static_cast<uint32_t>(bottom_max_degree);
 }
 
 HGraphSearchParameters
@@ -308,6 +309,12 @@ HGraphSearchParameters::FromJson(const std::string& json_string) {
     if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_ENABLE_STATS)) {
         obj.cspg_enable_stats =
             params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_ENABLE_STATS].GetBool();
+    }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_MAX_ROUTING_FANOUT)) {
+        obj.cspg_max_routing_fanout =
+            params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_MAX_ROUTING_FANOUT].GetInt();
+        CHECK_ARGUMENT(obj.cspg_max_routing_fanout >= 0,
+                       "cspg_max_routing_fanout must be >= 0");
     }
     if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_HOPS_LIMIT)) {
         obj.hops_limit = params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_HOPS_LIMIT].GetInt();

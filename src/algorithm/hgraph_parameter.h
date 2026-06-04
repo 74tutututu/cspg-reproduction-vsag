@@ -74,6 +74,8 @@ public:
     int cspg_m{1};
     float cspg_lambda{0.5F};
     int cspg_partition_max_degree{0};
+    // CSPG partition graph 构图类型，默认 "odescent"；显式设置 "nsw" 可走 NSW 插入路径。
+    std::string cspg_partition_graph_type{"odescent"};
     // ===========================
 
     std::string name;
@@ -97,6 +99,8 @@ public:
     int64_t cspg_recursive_fanout_bound_slack_percent{0};
     int64_t cspg_local_routing_budget{0};
     bool cspg_enable_stats{false};
+    // 每次遇到 routing vector 时最多向几个其他 partition 添加状态；0 = 不限制（论文行为）。
+    int64_t cspg_max_routing_fanout{0};
     uint32_t hops_limit{std::numeric_limits<uint32_t>::max()};
     bool use_reorder{false};
     bool use_extra_info_filter{false};

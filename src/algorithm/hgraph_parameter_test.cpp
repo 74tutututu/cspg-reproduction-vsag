@@ -58,6 +58,7 @@ struct HGraphDefaultParam {
     int cspg_m = 1;
     float cspg_lambda = 0.5F;
     int cspg_partition_max_degree = 0;
+    std::string cspg_partition_graph_type = "odescent";
 };
 
 std::string
@@ -114,7 +115,8 @@ generate_hgraph_param(const HGraphDefaultParam& param) {
         "support_duplicate": {},
         "cspg_m": {},
         "cspg_lambda": {},
-        "cspg_partition_max_degree": {}
+        "cspg_partition_max_degree": {},
+        "cspg_partition_graph_type": "{}"
     }})";
 
     return fmt::format(param_str,
@@ -132,15 +134,18 @@ generate_hgraph_param(const HGraphDefaultParam& param) {
                        param.support_duplicate,
                        param.cspg_m,
                        param.cspg_lambda,
-                       param.cspg_partition_max_degree);
+                       param.cspg_partition_max_degree,
+                       param.cspg_partition_graph_type);
 }
 
 TEST_CASE("HGraph Parameters CheckCompatibility", "[ut][HGraphParameter][CheckCompatibility]"){
-    SECTION("cspg disabled by default"){vsag::HGraphParameter param;
-REQUIRE(param.cspg_m == 1);
-REQUIRE(std::abs(param.cspg_lambda - 0.5F) < 1e-6F);
-REQUIRE(param.cspg_partition_max_degree == 0);
-}
+    SECTION("cspg disabled by default") {
+        vsag::HGraphParameter param;
+        REQUIRE(param.cspg_m == 1);
+        REQUIRE(std::abs(param.cspg_lambda - 0.5F) < 1e-6F);
+        REQUIRE(param.cspg_partition_max_degree == 0);
+        REQUIRE(param.cspg_partition_graph_type == "odescent");
+    }
 
 SECTION("wrong parameter type") {
     HGraphDefaultParam default_param;
@@ -174,6 +179,8 @@ TEST_COMPATIBILITY_CASE("different cspg_m", cspg_m, 2, 4, false)
 TEST_COMPATIBILITY_CASE("different cspg_lambda", cspg_lambda, 0.5F, 0.3F, false)
 TEST_COMPATIBILITY_CASE(
     "different cspg_partition_max_degree", cspg_partition_max_degree, 16, 24, false)
+TEST_COMPATIBILITY_CASE(
+    "different cspg_partition_graph_type", cspg_partition_graph_type, "odescent", "nsw", false)
 }
 
 TEST_CASE("HGraph Parameters ResolveCspgPartitionMaxDegree", "[ut][HGraphParameter][ResolveCspgPartitionMaxDegree]") {
@@ -188,7 +195,7 @@ TEST_CASE("HGraph Parameters ResolveCspgPartitionMaxDegree", "[ut][HGraphParamet
         REQUIRE(param->ResolveCspgPartitionMaxDegree() == 28);
     }
 
-    SECTION("scale default partition degree by partition size ratio") {
+    SECTION("use full bottom degree by default (paper-aligned, cspg enabled)") {
         HGraphDefaultParam default_param;
         default_param.max_degree = 32;
         default_param.cspg_m = 2;
@@ -196,10 +203,10 @@ TEST_CASE("HGraph Parameters ResolveCspgPartitionMaxDegree", "[ut][HGraphParamet
         default_param.cspg_partition_max_degree = 0;
         auto param = std::make_shared<vsag::HGraphParameter>();
         param->FromString(generate_hgraph_param(default_param));
-        REQUIRE(param->ResolveCspgPartitionMaxDegree() == 24);
+        REQUIRE(param->ResolveCspgPartitionMaxDegree() == 32);
     }
 
-    SECTION("disable scaling when cspg is off") {
+    SECTION("use full bottom degree by default (cspg off)") {
         HGraphDefaultParam default_param;
         default_param.max_degree = 32;
         default_param.cspg_m = 1;
@@ -311,5 +318,22 @@ TEST_CASE("HGraph Search Parameters Parse CSPG", "[ut][HGraphParameter][Search]"
     SECTION("reject invalid cspg local routing budget") {
         REQUIRE_THROWS(vsag::HGraphSearchParameters::FromJson(
             R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_local_routing_budget":-1}})"));
+    }
+
+    SECTION("parse cspg max routing fanout") {
+        auto params = vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":30,"cspg_max_routing_fanout":2}})");
+        REQUIRE(params.cspg_max_routing_fanout == 2);
+    }
+
+    SECTION("default cspg max routing fanout is 0 (unlimited)") {
+        auto params =
+            vsag::HGraphSearchParameters::FromJson(R"({"hgraph":{"ef_search":60,"cspg_ef1":1}})");
+        REQUIRE(params.cspg_max_routing_fanout == 0);
+    }
+
+    SECTION("reject invalid cspg max routing fanout") {
+        REQUIRE_THROWS(vsag::HGraphSearchParameters::FromJson(
+            R"({"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_max_routing_fanout":-1}})"));
     }
 }

@@ -268,6 +268,9 @@ private:
     std::vector<int64_t>
     build_by_odescent(const DatasetPtr& data);
 
+    std::vector<int64_t>
+    build_cspg_by_partition(const DatasetPtr& data);
+
     void
     add_one_point(const void* data, int level, InnerIdType id);
 
@@ -433,6 +436,7 @@ private:
 
     ODescentParameterPtr odescent_param_{nullptr};
     std::string graph_type_{GRAPH_TYPE_VALUE_NSW};
+    std::string cspg_partition_graph_type_{GRAPH_TYPE_VALUE_ODESCENT};
 
     uint64_t ef_construct_{400};
     float alpha_{1.0};

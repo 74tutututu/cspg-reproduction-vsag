@@ -148,6 +148,7 @@ const char* const HGRAPH_BUILD_BY_BASE_QUANTIZATION = "build_by_base";
 const char* const HGRAPH_BASE_QUANTIZATION_TYPE = "base_quantization_type";
 const char* const HGRAPH_GRAPH_MAX_DEGREE = "max_degree";
 const char* const HGRAPH_CSPG_PARTITION_MAX_DEGREE = "cspg_partition_max_degree";
+const char* const HGRAPH_CSPG_PARTITION_GRAPH_TYPE = "cspg_partition_graph_type";
 const char* const HGRAPH_BUILD_EF_CONSTRUCTION = "ef_construction";
 const char* const HGRAPH_BUILD_ALPHA = "alpha";
 const char* const HGRAPH_INIT_CAPACITY = "hgraph_init_capacity";
@@ -179,6 +180,7 @@ const char* const HGRAPH_PARAMETER_CSPG_RECURSIVE_FANOUT_BOUND_SLACK_PERCENT =
     "cspg_recursive_fanout_bound_slack_percent";
 const char* const HGRAPH_PARAMETER_CSPG_LOCAL_ROUTING_BUDGET = "cspg_local_routing_budget";
 const char* const HGRAPH_PARAMETER_CSPG_ENABLE_STATS = "cspg_enable_stats";
+const char* const HGRAPH_PARAMETER_CSPG_MAX_ROUTING_FANOUT = "cspg_max_routing_fanout";
 const char* const HGRAPH_PARAMETER_HOPS_LIMIT = "hops_limit";
 const char* const HGRAPH_EXTRA_INFO_SIZE = "extra_info_size";
 const char* const HGRAPH_SUPPORT_DUPLICATE = "support_duplicate";
