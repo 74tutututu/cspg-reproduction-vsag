@@ -21,6 +21,7 @@
 
 #include "algorithm/hgraph.h"
 #include "algorithm/ivf.h"
+#include "analyzer/hgraph_analyzer.h"
 #include "index/index_impl.h"
 #include "inner_string_params.h"
 #include "storage/serialization.h"
@@ -154,6 +155,14 @@ public:
 
     void
     ShowIndexProperty() const {
+        if (inner_hgraph_ != nullptr && index_param_.Contains("cspg_m") &&
+            index_param_["cspg_m"].GetInt() > 1) {
+            auto allocator = Engine::CreateDefaultAllocator();
+            AnalyzerParam analyzer_param(allocator.get());
+            HGraphAnalyzer analyzer(inner_hgraph_.get(), analyzer_param);
+            logger::info("cspg structure stats: {}", analyzer.GetCspgStructureStats().Dump(4));
+            return;
+        }
         logger::info("index inner property: {}", index_->GetStats());
     }
 
@@ -222,6 +231,7 @@ private:
             hgraph_parameter->data_type = data_type_;
             auto inner_index = std::make_shared<HGraph>(hgraph_parameter, index_common_params);
             inner_index->Deserialize(reader);
+            inner_hgraph_ = inner_index;
             index_ = std::make_shared<IndexImpl<HGraph>>(inner_index, index_common_params);
             return true;
         } else if (index_name_ == INDEX_IVF) {
@@ -239,6 +249,7 @@ private:
 
 private:
     IndexPtr index_{nullptr};
+    std::shared_ptr<HGraph> inner_hgraph_{nullptr};
     std::string build_param_;
     int64_t dim_;
     int64_t extra_info_size_;

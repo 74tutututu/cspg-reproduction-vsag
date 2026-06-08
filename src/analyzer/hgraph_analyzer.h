@@ -55,6 +55,9 @@ public:
     std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, float>
     GetDegreeDistribution();
 
+    JsonType
+    GetCspgStructureStats();
+
     float
     GetBaseSearchRecall(const std::string& search_param);
 

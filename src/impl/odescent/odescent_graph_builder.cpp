@@ -105,7 +105,11 @@ ODescent::init_graph(const GraphInterfacePtr& graph_storage) {
         for (uint32_t i = 0; i < data_num_; ++i) {
             inner_ids_to_locs[valid_ids_[i]] = i;
         }
-        id_map_func = [&](uint32_t id) -> uint32_t { return inner_ids_to_locs[id]; };
+        id_map_func = [&](uint32_t id) -> uint32_t {
+            auto iter = inner_ids_to_locs.find(id);
+            return iter == inner_ids_to_locs.end() ? std::numeric_limits<uint32_t>::max()
+                                                   : iter->second;
+        };
     }
     auto task = [&, this](int64_t start, int64_t end) {
         std::random_device rd;
@@ -403,6 +407,9 @@ ODescent::init_one_edge(int64_t i,
         } else {
             for (valid_id_count = 0; valid_id_count < edges.size(); ++valid_id_count) {
                 uint32_t neighbor_loc = id_map_func(edges[valid_id_count]);
+                if (neighbor_loc == std::numeric_limits<uint32_t>::max()) {
+                    continue;
+                }
                 graph_[i].neighbors.emplace_back(neighbor_loc, get_distance(neighbor_loc, i));
                 ids_set.insert(neighbor_loc);
             }

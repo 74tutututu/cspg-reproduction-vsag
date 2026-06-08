@@ -15,9 +15,15 @@
 
 #include "hgraph_analyzer.h"
 
+#include <numeric>
+
 #include "impl/heap/standard_heap.h"
 
 namespace vsag {
+
+namespace {
+constexpr int kAnalyzerCspgRoutingPartition = -1;
+}
 
 Vector<int64_t>
 HGraphAnalyzer::GetComponentCount() {
@@ -532,6 +538,235 @@ HGraphAnalyzer::GetDegreeDistribution() {
     }
     auto avg_degree = static_cast<float>(total_degree) / static_cast<float>(valid_id_count);
     return {count_in_degree, count_out_degree, avg_degree};
+}
+
+JsonType
+HGraphAnalyzer::GetCspgStructureStats() {
+    JsonType stats;
+    const bool cspg_enabled = hgraph_->is_cspg_enabled();
+    stats["cspg_enabled"].SetBool(cspg_enabled);
+    if (!cspg_enabled) {
+        return stats;
+    }
+
+    auto graph_storage_type_to_string = [](GraphStorageTypes type) -> std::string {
+        switch (type) {
+            case GraphStorageTypes::GRAPH_STORAGE_TYPE_VALUE_FLAT:
+                return "flat";
+            case GraphStorageTypes::GRAPH_STORAGE_TYPE_VALUE_COMPRESSED:
+                return "compressed";
+            case GraphStorageTypes::GRAPH_STORAGE_TYPE_SPARSE:
+                return "sparse";
+        }
+        return "unknown";
+    };
+
+    const auto partition_count = static_cast<size_t>(std::max(1, hgraph_->cspg_m_));
+    const auto total_nodes = static_cast<size_t>(hgraph_->total_count_.load());
+    size_t routing_count = 0;
+    std::vector<uint32_t> partition_local_counts(partition_count, 0);
+    for (size_t id = 0; id < total_nodes && id < hgraph_->node_partition_.size(); ++id) {
+        const auto partition = hgraph_->node_partition_[id];
+        if (partition == kAnalyzerCspgRoutingPartition) {
+            ++routing_count;
+        } else if (partition >= 0 && static_cast<size_t>(partition) < partition_count) {
+            ++partition_local_counts[static_cast<size_t>(partition)];
+        }
+    }
+
+    stats["graph_storage_type"].SetString(graph_storage_type_to_string(
+        hgraph_->cspg_partition_graph_param_ != nullptr
+            ? hgraph_->cspg_partition_graph_param_->graph_storage_type_
+            : GraphStorageTypes::GRAPH_STORAGE_TYPE_VALUE_FLAT));
+    stats["partition_count"].SetInt(partition_count);
+    stats["total_nodes"].SetInt(total_nodes);
+    stats["routing_count"].SetInt(routing_count);
+    stats["routing_ratio"].SetFloat(total_nodes == 0
+                                        ? 0.0F
+                                        : static_cast<float>(routing_count) /
+                                              static_cast<float>(total_nodes));
+    stats["partition_route_graph_levels_total"].SetInt(
+        std::accumulate(hgraph_->cspg_partition_route_graphs_.begin(),
+                        hgraph_->cspg_partition_route_graphs_.end(),
+                        uint64_t{0},
+                        [](uint64_t sum, const auto& levels) { return sum + levels.size(); }));
+
+    JsonType partitions;
+    for (size_t partition_id = 0; partition_id < partition_count; ++partition_id) {
+        JsonType partition_stats;
+        partition_stats["partition_id"].SetInt(partition_id);
+        partition_stats["local_count"].SetInt(partition_local_counts[partition_id]);
+        partition_stats["routing_count_expected"].SetInt(routing_count);
+        const auto expected_member_count =
+            static_cast<size_t>(partition_local_counts[partition_id]) + routing_count;
+        partition_stats["expected_member_count"].SetInt(expected_member_count);
+
+        auto graph = hgraph_->get_cspg_partition_graph(static_cast<int>(partition_id));
+        if (graph == nullptr) {
+            partition_stats["graph_present"].SetBool(false);
+            partitions[std::to_string(partition_id)].SetJson(partition_stats);
+            continue;
+        }
+        partition_stats["graph_present"].SetBool(true);
+        partition_stats["graph_total_count"].SetInt(graph->TotalCount());
+        partition_stats["graph_max_capacity"].SetInt(graph->MaxCapacity());
+        partition_stats["graph_max_degree"].SetInt(graph->MaximumDegree());
+        partition_stats["entry_point"].SetInt(
+            partition_id < hgraph_->cspg_partition_entry_points_.size()
+                ? hgraph_->cspg_partition_entry_points_[partition_id]
+                : INVALID_ENTRY_POINT);
+
+        uint64_t local_missing_count = 0;
+        uint64_t routing_missing_count = 0;
+        uint64_t false_positive_exists_count = 0;
+        uint64_t local_nonrouting_with_routing_neighbor_count = 0;
+        uint64_t local_nonrouting_with_local_neighbor_count = 0;
+        uint64_t local_nonrouting_zero_degree_count = 0;
+        uint64_t local_degree_sum = 0;
+        uint64_t routing_degree_sum = 0;
+        uint64_t routing_present_count = 0;
+        uint64_t local_to_routing_edge_sum = 0;
+        uint64_t local_to_local_edge_sum = 0;
+        uint64_t routing_to_local_edge_sum = 0;
+        uint64_t routing_to_routing_edge_sum = 0;
+
+        Vector<InnerIdType> neighbors(allocator_);
+        for (size_t id = 0; id < total_nodes; ++id) {
+            if (hgraph_->label_table_->IsRemoved(id)) {
+                continue;
+            }
+            const bool exists = graph->CheckIdExists(static_cast<InnerIdType>(id));
+            const auto node_partition = hgraph_->node_partition_[id];
+            const bool is_routing = node_partition == kAnalyzerCspgRoutingPartition;
+            const bool is_local =
+                node_partition >= 0 && static_cast<size_t>(node_partition) == partition_id;
+
+            if (is_local) {
+                if (!exists) {
+                    ++local_missing_count;
+                    continue;
+                }
+                neighbors.clear();
+                graph->GetNeighbors(static_cast<InnerIdType>(id), neighbors);
+                local_degree_sum += neighbors.size();
+                if (neighbors.empty()) {
+                    ++local_nonrouting_zero_degree_count;
+                }
+                bool has_routing_neighbor = false;
+                bool has_local_neighbor = false;
+                for (auto neighbor : neighbors) {
+                    if (neighbor < 0 ||
+                        static_cast<size_t>(neighbor) >= hgraph_->node_partition_.size()) {
+                        continue;
+                    }
+                    const auto neighbor_partition = hgraph_->node_partition_[neighbor];
+                    if (neighbor_partition == kAnalyzerCspgRoutingPartition) {
+                        has_routing_neighbor = true;
+                        ++local_to_routing_edge_sum;
+                    } else if (neighbor_partition >= 0 &&
+                               static_cast<size_t>(neighbor_partition) == partition_id) {
+                        has_local_neighbor = true;
+                        ++local_to_local_edge_sum;
+                    }
+                }
+                if (has_routing_neighbor) {
+                    ++local_nonrouting_with_routing_neighbor_count;
+                }
+                if (has_local_neighbor) {
+                    ++local_nonrouting_with_local_neighbor_count;
+                }
+            } else if (is_routing) {
+                if (!exists) {
+                    ++routing_missing_count;
+                    continue;
+                }
+                neighbors.clear();
+                graph->GetNeighbors(static_cast<InnerIdType>(id), neighbors);
+                routing_degree_sum += neighbors.size();
+                ++routing_present_count;
+                for (auto neighbor : neighbors) {
+                    if (neighbor < 0 ||
+                        static_cast<size_t>(neighbor) >= hgraph_->node_partition_.size()) {
+                        continue;
+                    }
+                    const auto neighbor_partition = hgraph_->node_partition_[neighbor];
+                    if (neighbor_partition == kAnalyzerCspgRoutingPartition) {
+                        ++routing_to_routing_edge_sum;
+                    } else if (neighbor_partition >= 0 &&
+                               static_cast<size_t>(neighbor_partition) == partition_id) {
+                        ++routing_to_local_edge_sum;
+                    }
+                }
+            } else if (exists) {
+                ++false_positive_exists_count;
+            }
+        }
+
+        partition_stats["local_missing_count"].SetInt(local_missing_count);
+        partition_stats["routing_missing_count"].SetInt(routing_missing_count);
+        partition_stats["storage_false_positive_exists_count"].SetInt(false_positive_exists_count);
+        partition_stats["storage_false_positive_exists_ratio"].SetFloat(
+            total_nodes == routing_count + partition_local_counts[partition_id]
+                ? 0.0F
+                : static_cast<float>(false_positive_exists_count) /
+                      static_cast<float>(
+                          total_nodes - routing_count - partition_local_counts[partition_id]));
+        partition_stats["storage_sparse_id_mismatch_suspected"].SetBool(
+            false_positive_exists_count > 0 &&
+            hgraph_->cspg_partition_graph_param_ != nullptr &&
+            hgraph_->cspg_partition_graph_param_->graph_storage_type_ !=
+                GraphStorageTypes::GRAPH_STORAGE_TYPE_SPARSE);
+        partition_stats["local_nonrouting_with_routing_neighbor_ratio"].SetFloat(
+            partition_local_counts[partition_id] == 0
+                ? 0.0F
+                : static_cast<float>(local_nonrouting_with_routing_neighbor_count) /
+                      static_cast<float>(partition_local_counts[partition_id]));
+        partition_stats["local_nonrouting_with_local_neighbor_ratio"].SetFloat(
+            partition_local_counts[partition_id] == 0
+                ? 0.0F
+                : static_cast<float>(local_nonrouting_with_local_neighbor_count) /
+                      static_cast<float>(partition_local_counts[partition_id]));
+        partition_stats["local_nonrouting_zero_degree_ratio"].SetFloat(
+            partition_local_counts[partition_id] == 0
+                ? 0.0F
+                : static_cast<float>(local_nonrouting_zero_degree_count) /
+                      static_cast<float>(partition_local_counts[partition_id]));
+        partition_stats["local_avg_degree"].SetFloat(
+            partition_local_counts[partition_id] == 0
+                ? 0.0F
+                : static_cast<float>(local_degree_sum) /
+                      static_cast<float>(partition_local_counts[partition_id]));
+        partition_stats["routing_present_count"].SetInt(routing_present_count);
+        partition_stats["routing_avg_degree"].SetFloat(
+            routing_present_count == 0
+                ? 0.0F
+                : static_cast<float>(routing_degree_sum) /
+                      static_cast<float>(routing_present_count));
+        partition_stats["local_to_routing_avg_edges"].SetFloat(
+            partition_local_counts[partition_id] == 0
+                ? 0.0F
+                : static_cast<float>(local_to_routing_edge_sum) /
+                      static_cast<float>(partition_local_counts[partition_id]));
+        partition_stats["local_to_local_avg_edges"].SetFloat(
+            partition_local_counts[partition_id] == 0
+                ? 0.0F
+                : static_cast<float>(local_to_local_edge_sum) /
+                      static_cast<float>(partition_local_counts[partition_id]));
+        partition_stats["routing_to_local_avg_edges"].SetFloat(
+            routing_present_count == 0
+                ? 0.0F
+                : static_cast<float>(routing_to_local_edge_sum) /
+                      static_cast<float>(routing_present_count));
+        partition_stats["routing_to_routing_avg_edges"].SetFloat(
+            routing_present_count == 0
+                ? 0.0F
+                : static_cast<float>(routing_to_routing_edge_sum) /
+                      static_cast<float>(routing_present_count));
+
+        partitions[std::to_string(partition_id)].SetJson(partition_stats);
+    }
+    stats["partitions"].SetJson(partitions);
+    return stats;
 }
 
 }  // namespace vsag
