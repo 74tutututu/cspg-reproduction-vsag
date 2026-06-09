@@ -277,6 +277,10 @@ HGraphSearchParameters::FromJson(const std::string& json_string) {
         obj.cspg_phase1_use_route_descent =
             params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_PHASE1_USE_ROUTE_DESCENT].GetBool();
     }
+    if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_PHASE1_SKIP_BASE_DESCENT)) {
+        obj.cspg_phase1_skip_base_descent =
+            params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_PHASE1_SKIP_BASE_DESCENT].GetBool();
+    }
     if (params[INDEX_TYPE_HGRAPH].Contains(HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_HOPS_LIMIT)) {
         obj.cspg_cross_partition_hops_limit =
             params[INDEX_TYPE_HGRAPH][HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_HOPS_LIMIT].GetInt();

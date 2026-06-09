@@ -3275,7 +3275,11 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
                         partition_id < this->cspg_partition_route_graphs_.size()
                             ? &this->cspg_partition_route_graphs_[partition_id]
                             : nullptr;
-                    for (int current_level = route_entry_level; current_level >= 0;
+                    // When skipping the base-layer beam, stop the route descent
+                    // above level 0 so phase-2 performs the single base-layer
+                    // search instead of redoing it here.
+                    const int min_route_level = params.cspg_phase1_skip_base_descent ? 1 : 0;
+                    for (int current_level = route_entry_level; current_level >= min_route_level;
                          --current_level) {
                         if (route_graphs != nullptr &&
                             static_cast<size_t>(current_level) < route_graphs->size()) {
@@ -3311,6 +3315,29 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
                 choose_entry_point(partition_graph, phase1_preferred_ep, partition_id);
             if (phase1_entry == INVALID_ENTRY_POINT) {
                 return {INVALID_ENTRY_POINT, std::numeric_limits<float>::max()};
+            }
+
+            // Fast path: when route descent already produced an entry and the
+            // base-layer beam is being skipped, return that entry directly. The
+            // base-layer descent that the beam would do is left to phase-2,
+            // avoiding the duplicated traversal after the visited reset.
+            if (params.cspg_phase1_use_route_descent && params.cspg_phase1_skip_base_descent &&
+                phase1_preferred_ep != INVALID_ENTRY_POINT) {
+                float entry_dist = std::numeric_limits<float>::max();
+                this->basic_flatten_codes_->Query(&entry_dist, computer, &phase1_entry, 1, &ctx);
+                uint32_t phase1_dist_cmp = route_phase1_dist_cmp + 1;
+                uint32_t phase1_hops = route_phase1_hops;
+                if (ctx.stats != nullptr) {
+                    ctx.stats->hops.fetch_add(phase1_hops, std::memory_order_relaxed);
+                    ctx.stats->dist_cmp.fetch_add(phase1_dist_cmp, std::memory_order_relaxed);
+                    if (params.cspg_enable_stats) {
+                        ctx.stats->cspg_phase1_hops.fetch_add(phase1_hops,
+                                                              std::memory_order_relaxed);
+                        ctx.stats->cspg_phase1_dist_cmp.fetch_add(phase1_dist_cmp,
+                                                                  std::memory_order_relaxed);
+                    }
+                }
+                return {phase1_entry, entry_dist};
             }
 
             struct Phase1State {

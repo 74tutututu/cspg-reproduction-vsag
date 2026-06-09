@@ -94,6 +94,12 @@ public:
     // 默认贴近论文 Algorithm 1，不先走 route graph。
     // 需要 HGraph 风格增强路径时可显式设为 true.
     bool cspg_phase1_use_route_descent{false};
+    // When route descent is on, skip the redundant flat base-layer beam in
+    // phase-1: stop the route descent above level 0 and hand the route entry
+    // straight to phase-2, which performs the single base-layer search. This
+    // removes the duplicated base-layer descent that phase-2 would otherwise
+    // repeat after the visited reset.
+    bool cspg_phase1_skip_base_descent{false};
     int64_t cspg_cross_partition_hops_limit{0};
     int64_t cspg_cross_partition_switch_limit{0};
     int64_t cspg_recursive_fanout_bound_slack_percent{0};

@@ -934,6 +934,50 @@ TEST_CASE("(PR) HGraph CSPG Search Smoke", "[ft][hgraph][pr][cspg]") {
     REQUIRE(cspg_metrics.average_hops <= baseline_metrics.average_hops * 3.5);
 }
 
+TEST_CASE("(PR) HGraph CSPG Phase1 Skip Base Descent Smoke", "[ft][hgraph][pr][cspg]") {
+    constexpr int64_t dim = 64;
+    constexpr int64_t base_count = 600;
+    constexpr int64_t ef_search = 120;
+    const std::string metric_type = "l2";
+
+    auto dataset =
+        fixtures::HGraphTestIndex::pool.GetDatasetAndCreate(dim, base_count, metric_type);
+    auto cspg_param = fmt::format(fixtures::cspg_build_param_tmp,
+                                  metric_type,
+                                  dim,
+                                  fixtures::HGraphTestIndex::dir.GenerateRandomFile());
+    auto cspg_index =
+        fixtures::TestIndex::TestFactory(fixtures::HGraphTestIndex::name, cspg_param, true);
+    fixtures::TestIndex::TestBuildIndex(cspg_index, dataset, true);
+
+    // Route descent feeds phase-2 an entry directly; skipping the base-layer
+    // beam must not break correctness. Recall should stay comparable to the
+    // plain route-descent path.
+    auto route_search_param = fmt::format(
+        R"({{"hgraph":{{"ef_search":{},"cspg_ef1":1,"cspg_ef2":{},)"
+        R"("cspg_phase1_use_route_descent":true}}}})",
+        ef_search,
+        ef_search);
+    auto skip_search_param = fmt::format(
+        R"({{"hgraph":{{"ef_search":{},"cspg_ef1":1,"cspg_ef2":{},)"
+        R"("cspg_phase1_use_route_descent":true,"cspg_phase1_skip_base_descent":true}}}})",
+        ef_search,
+        ef_search);
+
+    const auto route_metrics =
+        fixtures::CollectSearchMetrics(cspg_index, dataset, route_search_param, "cspg_route");
+    const auto skip_metrics =
+        fixtures::CollectSearchMetrics(cspg_index, dataset, skip_search_param, "cspg_skip");
+
+    INFO(fmt::format("route: recall={}, dist_cmp={}", route_metrics.average_recall,
+                     route_metrics.average_dist_cmp));
+    INFO(fmt::format("skip: recall={}, dist_cmp={}", skip_metrics.average_recall,
+                     skip_metrics.average_dist_cmp));
+    REQUIRE(skip_metrics.average_recall >= 0.85F);
+    // Skipping the redundant base-layer beam must not materially hurt recall.
+    REQUIRE(skip_metrics.average_recall + 0.05F >= route_metrics.average_recall);
+}
+
 TEST_CASE("(PR) HGraph CSPG Serialize Smoke", "[ft][hgraph][pr][cspg][serialization]") {
     constexpr int64_t dim = 64;
     constexpr int64_t base_count = 600;

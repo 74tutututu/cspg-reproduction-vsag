@@ -172,6 +172,8 @@ const char* const HGRAPH_PARAMETER_CSPG_PHASE1_PARTITION_COUNT =
     "cspg_phase1_partition_count";
 const char* const HGRAPH_PARAMETER_CSPG_PHASE1_USE_ROUTE_DESCENT =
     "cspg_phase1_use_route_descent";
+const char* const HGRAPH_PARAMETER_CSPG_PHASE1_SKIP_BASE_DESCENT =
+    "cspg_phase1_skip_base_descent";
 const char* const HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_HOPS_LIMIT =
     "cspg_cross_partition_hops_limit";
 const char* const HGRAPH_PARAMETER_CSPG_CROSS_PARTITION_SWITCH_LIMIT =
