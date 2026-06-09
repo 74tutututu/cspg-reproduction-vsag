@@ -4,75 +4,107 @@
 
 在 VSAG 的 HGraph（HNSW）基础上实现了 CSPG (NeurIPS 2024) 四个核心算法：
 
-- **Algorithm 1（Search）**：phase-1 在 G1 单分区 beam search（ef1），重置 visited，phase-2 在全分区 beam search（ef2），routing vector 触发向其他分区的状态扩张。
+- **Algorithm 1（Search）**：phase-1 在单分区 beam search（ef1），重置 visited，phase-2 跨全分区 beam search（ef2），routing vector 触发向其他分区的状态扩张。
 - **Algorithm 2（Batch Build）**：采样 routing vectors，其余按 partition 分配，分别构建分区图。
 - **Algorithm 3（Online Insert）**：routing vector 插入所有 m 个分区图；local vector 只插入所属分区。
 - **Algorithm 4（Delete）**：从所有相关分区图中删除。
 
 新增参数：
-- `cspg_partition_graph_type`（`"odescent"` / `"nsw"`）：控制分区图构建方式，解耦于全局 graph_type
-- `cspg_max_routing_fanout`（search 参数，默认 0 = 不限制）：限制每个 routing vector 触发的跨分区状态数
+- `cspg_partition_graph_type`（`"odescent"` / `"nsw"`）：控制分区图构建方式，与全局 graph_type 解耦
+- `cspg_max_routing_fanout`（search 参数，默认 0 = 不限）：限制每个 routing vector 触发的跨分区状态数
 
 ---
 
-## 实验结果
+## 正式实验结果
 
-### 100k SIFT-128，efc=300，单线程搜索
+**实验设置**（对齐论文）：SIFT1M，1M 全量数据，10k queries，20 线程搜索，efc=300，M=32，m=2，λ=0.5，分区图类型 NSW，ef/ef2 扫描 {10,20,40,60,100,150,200,300}。
 
-| Config | Recall | QPS | hops | dist_cmp | routing_pops% |
-|--------|--------|-----|------|----------|---------------|
-| baseline ef=20 | 0.1386 | 15138 | 32.1 | 487 | — |
-| baseline ef=30 | 0.1402 | 12000 | ~42 | ~590 | — |
-| CSPG NSW ef2=15 | 0.1338 | 16340 | 33.8 | 501 | 70% |
-| CSPG NSW ef2=20 | 0.1368 | 13507 | 41.2 | 584 | 69% |
-| CSPG NSW ef2=25 | 0.1384 | 12711 | 48.2 | 660 | 69% |
-| CSPG ODescent ef2=20 | ~0.12 | ~7500 | — | — | — |
+### QPS vs Recall@10 对比
 
-### 100k SIFT-128，efc=128 对比（论文设置）
+| ef(baseline) / ef2(CSPG) | Baseline Recall | Baseline QPS | CSPG Recall | CSPG QPS | QPS 比 |
+|--------------------------|-----------------|--------------|-------------|----------|--------|
+| 10  | 0.729 | 156344 | 0.729 | 94470 | 0.60x |
+| 20  | 0.857 | 115929 | 0.862 | 68528 | 0.59x |
+| 40  | 0.942 |  72492 | 0.944 | 45316 | 0.63x |
+| 60  | 0.970 |  50762 | 0.971 | 32445 | 0.64x |
+| 100 | 0.989 |  33675 | 0.989 | 22552 | 0.67x |
+| 150 | 0.996 |  23363 | 0.996 | 16238 | 0.70x |
+| 200 | 0.998 |  17222 | 0.998 | 12631 | 0.73x |
+| 300 | 0.999 |  13292 | 0.999 |  8256 | 0.62x |
 
-| Config | Recall | QPS | dist_cmp |
-|--------|--------|-----|----------|
-| baseline efc=128 ef=20 | 0.1372 | 16364 | 449 |
-| CSPG NSW efc=128 ef2=15 | 0.1338 | 16340 | 501 |
-| CSPG NSW efc=128 ef2=20 | 0.1368 | 13507 | 584 |
+**结论：CSPG-HNSW 在 SIFT1M 所有 recall 点均慢于 baseline，QPS 约为 baseline 的 60–73%。**
 
-efc=128 下 CSPG ef2=15 与 baseline ef=20 QPS 几乎持平，但 recall 低 2.5%，dist_cmp 多 12%。
+### 内部开销分析（ef2=20 为例）
 
-### 1M SIFT-128（NSW 分区，m=2，λ=0.5，16线程构建）
+| 来源 | dist_cmp | hops | dist/hop |
+|------|----------|------|----------|
+| CSPG phase-1 | 200.5 | 8.8 | 22.8 |
+| CSPG phase-2 routing pops（69%） | 325.2 | 24.6 | 13.2 |
+| CSPG phase-2 local pops（31%） | 283.6 | 10.9 | 25.9 |
+| **CSPG 合计** | **809** | **44.4** | — |
+| **baseline ef=20** | **589** | **34.2** | **17.2** |
 
-| Config | Recall | QPS | build time |
-|--------|--------|-----|------------|
-| baseline efc=300 ef=20 | 0.845 | 9497 | ~100s |
-| CSPG NSW ef2=15 | 0.800 | 5305 | 1393s |
-| CSPG NSW ef2=20 | 0.832 | 4623 | — |
-| CSPG NSW ef2=30 | 0.854 | 3773 | — |
-
-1M 规模下 CSPG NSW QPS 约为 baseline 的 56%，build time 约 14×。
-
----
-
-## 观察到的核心问题
-
-**问题 1：高维路径压缩量为零。**
-CSPG 的理论加速来自分区后路径更短。对于 d=128、n=1M、分区后 n'=750k：
-路径长度比 ≈ (n'/n)^(1/d) = (0.75)^(1/128) ≈ 0.9978，几乎没有压缩。
-低维（如 d=4）才能获得明显路径减少。
-
-**问题 2：Routing state 占据 70% 的 phase-2 hops。**
-无论 m、lambda、分区图类型如何变化，routing vector 触发的状态扩张始终占 phase-2 hop 数的 69–70%。这使得有效搜索 hop 数被大量 routing pop 稀释。
-
-**问题 3：NSW 分区图构建时间过长。**
-1M 数据 NSW 分区构建需 1393s（≈23分钟），而 baseline HNSW 约 100s。
-论文实验的构建时间数据需要参考。
+关键观察：
+- CSPG "真实探索" hops（phase-1 + local pops）= 8.8 + 10.9 = **19.7 hops**，少于 baseline 34.2 hops。
+- 但 phase-1 独立耗费 200.5 dist_cmp（baseline 搜索全部才 589），加上 routing 扩张的 325.2 dist_cmp，总计 809 > 589。
+- 理论上 CSPG 确实减少了有效探索步数（~19.7 vs 34.2），但两段额外开销（独立 phase-1 + routing 广播）把节省全部抵消。
 
 ---
 
-## 想确认的问题
+## 评测方法修正记录
 
-1. **CSPG 的加速条件**：论文里的实验用的是什么数据集和维度？SIFT-128 是否是论文里 CSPG 有加速的场景？还是论文主要在低维或特定分布上有效？
+### 之前的错误（100k 实验 recall 无效）
 
-2. **Routing state 开销**：phase-2 中 70% 的 hop 是 routing pop，这是预期行为吗？论文里有没有对这部分的分析，或者实现上有什么规避方式？
+之前所有 100k 实验（recall≈0.13）均使用了 SIFT1M HDF5 文件的 1M ground truth。  
+`build_base_limit: 100000` 只建了 100k 索引，但评测在对比 1M 邻居：  
+recall≈0.13 = "13% 的真实 1M 邻居恰好落入 100k 子集"，与索引质量无关。
 
-3. **构建时间**：论文里 CSPG 的构建时间和 baseline 相比是什么关系？NSW 分区图 23分钟 vs baseline 100s，这个比例是否合理？
+### 修正后
 
-4. **ef_construction 设置**：论文用 efc=128，我们实验用了 efc=300 和 128，结果基本一致（CSPG 均未超过 baseline）。这个参数对结论影响不大，但想确认论文里的对比是否公平控制了这个变量。
+- Build：1M 全量，无 `build_base_limit`
+- Ground truth：HDF5 文件原生 1M ground truth（一致）
+- 搜索：20 线程（论文 24 线程，本机 22 核，取 20）
+- Queries：10000（论文设置）
+- ef 扫描：{10,20,40,60,100,150,200,300}（论文 [10,300]）
+
+---
+
+## 为何 CSPG-HNSW 在 SIFT1M 无加速——理论分析
+
+CSPG 加速比公式（Section 5.4）：
+
+```
+Speedup = α × β
+β = n^(1/d) log(n^(1/d))  /  (n')^(1/d) log(n'^(1/d))
+n' = λn + n(1-λ)/m（分区大小）
+```
+
+对 SIFT1M（d=128，n=1M，m=2，λ=0.5，n'=750k）：
+- β ≈ 1.023（路径长度减少仅 2.3%）
+- 论文 lim(d→∞) Speedup = α（高维下 β→1，加速全靠 α）
+
+α 来自 detour factor（w）和最小距离差（Δr）的改善，需要 baseline 算法本身有较大 detour。  
+**HNSW 的 detour factor 已经较小（靠近 MSNET），α 接近 1。**  
+**Vamana / HCNNG 的 avg_degree 更高、detour 更大，α 更大，论文 1.5x–2x 来自这两个算法。**
+
+---
+
+## 待确认的问题
+
+1. **论文 CSPG-HNSW SIFT1M speedup 具体是多少？**  
+   论文只说 Vamana/HCNNG ≥1.5x，未明确 HNSW 数字。从 Figure 3 估计约 1.1–1.3x。  
+   我们测得 0.60–0.73x，差距原因：avg_degree 未对齐？还是 HNSW 本身 detour 就小？
+
+2. **avg_degree 对齐的具体做法**  
+   论文说 "slightly adjust parameters to ensure average degree is same"。  
+   当前数据：我们 CSPG partition 图的 dist/hop ≈ 14–20，baseline ≈ 16–18，范围接近。  
+   是否需要额外调整，或者 avg_degree 差距不是主因？
+
+3. **论文构建时间 50s vs 我们 1393s**  
+   论文 Table 1：CSPG-HNSW SIFT1M build = 50s（vs baseline 33s，约 1.5x）。  
+   我们 NSW 分区构建 = 1393s（14x baseline）。  
+   论文用的分区图类型究竟是什么？如果是 KNNG/ODescent 类型，50s 合理；NSW 不可能 50s。
+
+4. **Routing state overhead（70%）是否在论文实现中存在？**  
+   phase-2 中 69% 的 hops 是 routing pop（无效探索），这大幅抵消了路径压缩的收益。  
+   论文原始代码（github.com/PUITAR/CSPG）中是否有对应开销？还是有规避机制？

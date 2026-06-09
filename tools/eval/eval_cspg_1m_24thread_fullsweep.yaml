@@ -1,0 +1,221 @@
+global:
+    exporters:
+      print-directly:
+        format: "table"
+        to: "stdout"
+      save-to-file:
+        format: "json"
+        to: "file:///tmp/vsag_eval_data/cspg_1m_24thread_fullsweep.json"
+
+# ============================================================
+# 正式对比实验：CSPG-HNSW vs baseline HNSW on SIFT1M
+# 修正了之前的三个评测问题：
+#   1. 使用 1M 全量数据（ground truth 与 build 规模一致）
+#   2. 20线程搜索（论文24线程，本机最多22线程，取20）
+#   3. ef2 扫描 [10,20,40,60,100,150,200,300]（论文 [10,300]）
+# 索引已预建（efc=300, M=32），本次 search-only
+# ============================================================
+
+# --- Baseline HNSW ef sweep ---
+
+baseline_1m_ef10:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":1}}'
+    search_params: '{"hgraph":{"ef_search":10}}'
+    index_path: "./index/nsw_fresh_baseline_1m"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    num_threads_searching: 20
+
+baseline_1m_ef20:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":1}}'
+    search_params: '{"hgraph":{"ef_search":20}}'
+    index_path: "./index/nsw_fresh_baseline_1m"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    num_threads_searching: 20
+
+baseline_1m_ef40:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":1}}'
+    search_params: '{"hgraph":{"ef_search":40}}'
+    index_path: "./index/nsw_fresh_baseline_1m"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    num_threads_searching: 20
+
+baseline_1m_ef60:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":1}}'
+    search_params: '{"hgraph":{"ef_search":60}}'
+    index_path: "./index/nsw_fresh_baseline_1m"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    num_threads_searching: 20
+
+baseline_1m_ef100:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":1}}'
+    search_params: '{"hgraph":{"ef_search":100}}'
+    index_path: "./index/nsw_fresh_baseline_1m"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    num_threads_searching: 20
+
+baseline_1m_ef150:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":1}}'
+    search_params: '{"hgraph":{"ef_search":150}}'
+    index_path: "./index/nsw_fresh_baseline_1m"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    num_threads_searching: 20
+
+baseline_1m_ef200:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":1}}'
+    search_params: '{"hgraph":{"ef_search":200}}'
+    index_path: "./index/nsw_fresh_baseline_1m"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    num_threads_searching: 20
+
+baseline_1m_ef300:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":1}}'
+    search_params: '{"hgraph":{"ef_search":300}}'
+    index_path: "./index/nsw_fresh_baseline_1m"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    num_threads_searching: 20
+
+# --- CSPG NSW ef2 sweep ---
+
+cspg_1m_nsw_ef2_10:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5,"cspg_partition_graph_type":"nsw"}}'
+    search_params: '{"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":10,"cspg_enable_stats":true}}'
+    index_path: "./index/nsw_cspg_1m_m2_lambda05"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    enable_cspg_stats: true
+    num_threads_searching: 20
+
+cspg_1m_nsw_ef2_20:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5,"cspg_partition_graph_type":"nsw"}}'
+    search_params: '{"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":20,"cspg_enable_stats":true}}'
+    index_path: "./index/nsw_cspg_1m_m2_lambda05"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    enable_cspg_stats: true
+    num_threads_searching: 20
+
+cspg_1m_nsw_ef2_40:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5,"cspg_partition_graph_type":"nsw"}}'
+    search_params: '{"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":40,"cspg_enable_stats":true}}'
+    index_path: "./index/nsw_cspg_1m_m2_lambda05"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    enable_cspg_stats: true
+    num_threads_searching: 20
+
+cspg_1m_nsw_ef2_60:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5,"cspg_partition_graph_type":"nsw"}}'
+    search_params: '{"hgraph":{"ef_search":60,"cspg_ef1":1,"cspg_ef2":60,"cspg_enable_stats":true}}'
+    index_path: "./index/nsw_cspg_1m_m2_lambda05"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    enable_cspg_stats: true
+    num_threads_searching: 20
+
+cspg_1m_nsw_ef2_100:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5,"cspg_partition_graph_type":"nsw"}}'
+    search_params: '{"hgraph":{"ef_search":120,"cspg_ef1":1,"cspg_ef2":100,"cspg_enable_stats":true}}'
+    index_path: "./index/nsw_cspg_1m_m2_lambda05"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    enable_cspg_stats: true
+    num_threads_searching: 20
+
+cspg_1m_nsw_ef2_150:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5,"cspg_partition_graph_type":"nsw"}}'
+    search_params: '{"hgraph":{"ef_search":200,"cspg_ef1":1,"cspg_ef2":150,"cspg_enable_stats":true}}'
+    index_path: "./index/nsw_cspg_1m_m2_lambda05"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    enable_cspg_stats: true
+    num_threads_searching: 20
+
+cspg_1m_nsw_ef2_200:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5,"cspg_partition_graph_type":"nsw"}}'
+    search_params: '{"hgraph":{"ef_search":250,"cspg_ef1":1,"cspg_ef2":200,"cspg_enable_stats":true}}'
+    index_path: "./index/nsw_cspg_1m_m2_lambda05"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    enable_cspg_stats: true
+    num_threads_searching: 20
+
+cspg_1m_nsw_ef2_300:
+    datapath: "/workspaces/vsag/tools/eval/data/sift-128-euclidean.hdf5"
+    type: "search"
+    index_name: "hgraph"
+    create_params: '{"dim":128,"dtype":"float32","metric_type":"l2","index_param":{"base_quantization_type":"fp32","max_degree":32,"ef_construction":300,"cspg_m":2,"cspg_lambda":0.5,"cspg_partition_graph_type":"nsw"}}'
+    search_params: '{"hgraph":{"ef_search":350,"cspg_ef1":1,"cspg_ef2":300,"cspg_enable_stats":true}}'
+    index_path: "./index/nsw_cspg_1m_m2_lambda05"
+    search_mode: "knn"
+    topk: 10
+    search_query_limit: 10000
+    enable_cspg_stats: true
+    num_threads_searching: 20
