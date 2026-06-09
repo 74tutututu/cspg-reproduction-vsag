@@ -3499,27 +3499,6 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
             uint16_t cross_partition_depth;
             uint16_t cross_partition_switches;
         };
-        struct CspgStateCompare {
-            bool
-            operator()(const CspgState& a, const CspgState& b) const {
-                if (a.dist != b.dist) {
-                    return a.dist < b.dist;
-                }
-                if (a.id != b.id) {
-                    return a.id < b.id;
-                }
-                if (a.from_cross_partition != b.from_cross_partition) {
-                    return a.from_cross_partition < b.from_cross_partition;
-                }
-                if (a.cross_partition_depth != b.cross_partition_depth) {
-                    return a.cross_partition_depth < b.cross_partition_depth;
-                }
-                if (a.cross_partition_switches != b.cross_partition_switches) {
-                    return a.cross_partition_switches < b.cross_partition_switches;
-                }
-                return a.partition_id < b.partition_id;
-            }
-        };
         struct CspgStateWorseFirstCompare {
             bool
             operator()(const CspgState& a, const CspgState& b) const {
@@ -3541,8 +3520,10 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
                 return a.partition_id > b.partition_id;
             }
         };
-        // Keep only the active stage-2 states in a bounded ordered frontier.
-        // The best state is kept at the back so pop is O(1) on the hot path.
+        // Active stage-2 states live in a binary min-heap keyed on distance, so
+        // enqueue/pop are O(log n) instead of the O(n) shifts of a sorted vector.
+        // The result-bound check gates what enters the frontier, so no separate
+        // ef2 trim is needed.
         Vector<CspgState> frontier(ctx.alloc);
         const auto frontier_hint =
             static_cast<size_t>(std::max<uint64_t>(16, std::min<uint64_t>(ef2, 4096)));
@@ -3569,7 +3550,9 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
         uint32_t stage2_routing_fanout_skipped_by_bound = 0;
         const auto partition_count = this->cspg_partition_graphs_.size();
 
-        CspgStateCompare state_less;
+        // std::*_heap with this comparator yields a heap whose front() is the
+        // smallest-distance (best) state, since "worse-first" makes larger
+        // distances compare as smaller.
         CspgStateWorseFirstCompare state_worse_first;
         auto current_bound = [&]() {
             if (stage2_results->Size() < ef2 || stage2_results->Empty()) {
@@ -3577,12 +3560,6 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
             }
             return stage2_results->Top().first;
         };
-        auto trim_frontier = [&]() {
-            if (frontier.size() > ef2) {
-                frontier.erase(frontier.begin());
-            }
-        };
-
         auto enqueue_state = [&](InnerIdType id,
                                  size_t partition_id,
                                  float dist,
@@ -3592,21 +3569,18 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
             if (id == INVALID_ENTRY_POINT) {
                 return false;
             }
-            auto state = CspgState{dist,
-                                   id,
-                                   partition_id,
-                                   from_cross_partition,
-                                   cross_partition_depth,
-                                   cross_partition_switches};
-            if (!frontier.empty() && frontier.size() >= ef2) {
-                if (!state_less(state, frontier.front())) {
-                    return false;
-                }
+            // Drop states no better than the ef2-th result: they could never
+            // enter the result set, so exploring them is pure overhead.
+            if (stage2_results->Size() >= ef2 && dist >= current_bound()) {
+                return false;
             }
-            auto insert_it =
-                std::lower_bound(frontier.begin(), frontier.end(), state, state_worse_first);
-            frontier.insert(insert_it, state);
-            trim_frontier();
+            frontier.push_back(CspgState{dist,
+                                         id,
+                                         partition_id,
+                                         from_cross_partition,
+                                         cross_partition_depth,
+                                         cross_partition_switches});
+            std::push_heap(frontier.begin(), frontier.end(), state_worse_first);
             return true;
         };
 
@@ -3847,10 +3821,11 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
                 break;
             }
 
-            const auto current = frontier.back();
-            if (stage2_results->Size() >= ef2 && current.dist > current_bound()) {
+            if (stage2_results->Size() >= ef2 && frontier.front().dist > current_bound()) {
                 break;
             }
+            std::pop_heap(frontier.begin(), frontier.end(), state_worse_first);
+            const auto current = frontier.back();
             frontier.pop_back();
             ++hops;
             const bool current_is_routing = is_cspg_routing_vector(current.id);
@@ -3876,7 +3851,7 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
                 }
             };
             if (!frontier.empty()) {
-                const auto& next = frontier.back();
+                const auto& next = frontier.front();
                 if (next.partition_id < this->cspg_partition_graphs_.size()) {
                     const auto& next_graph = this->cspg_partition_graphs_[next.partition_id];
                     if (next_graph != nullptr) {
